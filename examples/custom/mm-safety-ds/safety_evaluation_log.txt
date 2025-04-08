@@ -1,0 +1,37 @@
+安全分类器评估开始时间: 2025-03-13 21:40:41
+数据集路径: /home/hxm826/ms-swift/examples/custom/mm-safety-ds/mm_safety_dataset.jsonl
+模型路径: /LOCAL2/hxm826/qwen2.5-vl-safety-model-merged-update
+使用设备: cuda:0
+
+================================================================================
+
+数据集大小: 13083 条
+
+
+============ 批次处理统计 [0-199] ============
+处理样本数: 200, 成功: 200, 失败: 0
+批次处理时间: 73.05秒, 平均每样本: 0.37秒
+总体进度: 200/13083 (1.53%)
+
+批次评估结果:
+text_safety:
+  - accuracy: 0.8700
+  - precision: 0.8889
+  - recall: 0.9032
+  - f1: 0.8960
+text_category:
+  - accuracy: 0.8900
+  - macro_precision: 0.3986
+  - macro_recall: 0.3634
+  - macro_f1: 0.3762
+image_safety:
+  - accuracy: 0.5500
+  - precision: 0.1333
+  - recall: 0.2857
+  - f1: 0.1818
+image_category:
+  - accuracy: 0.0000
+  - macro_precision: 0.0000
+  - macro_recall: 0.0000
+  - macro_f1: 0.0000
+

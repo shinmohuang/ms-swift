@@ -371,6 +371,321 @@ class RepetitionPenalty(ORM):
         return rewards
 
 
+class SpatialReasoningStrictFormat(ORM):
+    """
+    Reward function that checks if the completion has the correct format.
+    Strict version requires specific line formatting.
+    """
+
+    def __call__(self, completions, **kwargs) -> List[float]:
+        rewards = []
+
+        # 处理不同格式的completions
+        processed_completions = []
+        for comp in completions:
+            if isinstance(comp, dict) and 'content' in comp:
+                processed_completions.append(comp['content'])
+            elif isinstance(comp, list) and len(comp) > 0:
+                if isinstance(comp[0], dict) and 'content' in comp[0]:
+                    processed_completions.append(comp[0]['content'])
+                else:
+                    processed_completions.append(str(comp[0]))
+            elif isinstance(comp, str):
+                processed_completions.append(comp)
+            else:
+                processed_completions.append(str(comp))
+
+        pattern = r"^<think>\n.*?\n</think>\n<response>\n.*?\n</response>\n<answer>.*?</answer>\n$"
+
+        for content in processed_completions:
+            try:
+                match = re.search(pattern, content, re.DOTALL)
+                if match:
+                    print(f"SpatialReasoningStrictFormat - Matched content: {match.group(0)}")
+                rewards.append(0.5 if match else 0.0)
+            except Exception as e:
+                print(f"Error in format check: {e}")
+                print(f"Content type: {type(content)}, Content: {content[:100]}...")
+                rewards.append(0.0)
+
+        return rewards
+
+
+class SpatialReasoningLooseFormat(ORM):
+    """
+    Reward function that checks if the completion has the correct format.
+    Supports multiple format patterns with different reward values.
+    """
+
+    def __call__(self, completions, **kwargs) -> List[float]:
+        rewards = []
+
+        # 处理不同格式的completions
+        processed_completions = []
+        for comp in completions:
+            try:
+                if isinstance(comp, dict) and 'content' in comp:
+                    processed_completions.append(comp['content'])
+                elif isinstance(comp, list) and len(comp) > 0:
+                    if isinstance(comp[0], dict) and 'content' in comp[0]:
+                        processed_completions.append(comp[0]['content'])
+                    else:
+                        processed_completions.append(str(comp[0]))
+                elif isinstance(comp, str):
+                    processed_completions.append(comp)
+                else:
+                    processed_completions.append(str(comp))
+            except Exception as e:
+                print(f"Error processing completion: {e}")
+                processed_completions.append("")
+
+        # 定义不同的格式模式和对应的奖励值
+        format_patterns = [
+            # 最佳格式: <think>...</think><answer>...</answer>
+            {
+                'pattern': r"<think>\s*.*?\s*</think>\s*<answer>\s*.*?\s*</answer>",
+                'reward': 1,
+                'description': "标准标签格式"
+            },
+            # "The Answer is **X**" 格式
+            {
+                'pattern': r"The Answer is\s*\*\*\s*[A-E]\s*\*\*",
+                'reward': 0.3,
+                'description': "The Answer is** 格式"
+            },
+            # 仅包含加粗答案 **X**
+            {
+                'pattern': r"\*\*\s*[A-E]\s*\*\*",
+                'reward': 0.2,
+                'description': "加粗答案格式"
+            },
+            # 有推理过程但没有正确使用标签
+            {
+                'pattern': r"(think|reasoning|分析|推理).*?(answer|conclusion|答案|结论)",
+                'reward': 0.1,
+                'description': "非标准推理和答案段落"
+            }
+        ]
+
+        for content in processed_completions:
+            try:
+                if not isinstance(content, str):
+                    content = str(content)
+
+                # 默认奖励为0
+                max_reward = 0.0
+                matched_format = None
+
+                # 检查所有格式模式
+                for format_spec in format_patterns:
+                    match = re.search(format_spec['pattern'], content, re.DOTALL | re.IGNORECASE)
+                    if match and format_spec['reward'] > max_reward:
+                        max_reward = format_spec['reward']
+                        matched_format = format_spec['description']
+
+                if matched_format:
+                    print(f"Matched format: {matched_format}, reward: {max_reward}")
+
+                rewards.append(max_reward)
+
+            except Exception as e:
+                print(f"Error in format check: {e}")
+                print(f"Content type: {type(content)}, Content preview: {str(content)[:100]}...")
+                rewards.append(0.0)
+
+        return rewards
+
+
+class SpatialReasoningAccuracyORM(ORM):
+    """
+    Reward function for spatial reasoning tasks that checks correctness of answers
+    """
+
+    def __call__(self, completions, solution, **kwargs) -> List[float]:
+        """
+        Args:
+            completions (list): Generated outputs from model
+            solution (list): Ground truth answers from dataset
+        Returns:
+            list[float]: Reward scores (1.0 for correct, 0.0 for incorrect)
+        """
+        rewards = []
+
+        # 输入验证
+        if not completions or not solution:
+            print("Warning: Empty completions or solution received")
+            return [0.0] * max(len(completions) if completions else 0, len(solution) if solution else 0, 1)
+
+        # GRPO训练时，completions可能有不同的格式，需要适当处理
+        processed_completions = []
+        for comp in completions:
+            try:
+                if isinstance(comp, dict) and 'content' in comp:
+                    processed_completions.append(comp['content'])
+                elif isinstance(comp, list) and len(comp) > 0:
+                    if isinstance(comp[0], dict) and 'content' in comp[0]:
+                        processed_completions.append(comp[0]['content'])
+                    else:
+                        processed_completions.append(str(comp[0]))
+                elif isinstance(comp, str):
+                    processed_completions.append(comp)
+                else:
+                    # 如果无法识别格式，转换为字符串
+                    processed_completions.append(str(comp))
+            except Exception as e:
+                print(f"Error processing completion: {e}")
+                processed_completions.append("")
+
+        # 确保solution也是字符串列表
+        processed_solutions = []
+        for sol in solution:
+            try:
+                if isinstance(sol, str):
+                    processed_solutions.append(sol)
+                else:
+                    processed_solutions.append(str(sol))
+            except Exception as e:
+                print(f"Error processing solution: {e}")
+                processed_solutions.append("")
+
+        # 确保处理后的列表长度匹配
+        if len(processed_completions) != len(processed_solutions):
+            print(
+                f"Warning: Mismatched lengths - completions: {len(processed_completions)}, solutions: {len(processed_solutions)}")
+            # 补齐短的列表
+            if len(processed_completions) < len(processed_solutions):
+                processed_completions.extend([""] * (len(processed_solutions) - len(processed_completions)))
+            else:
+                processed_solutions.extend([""] * (len(processed_completions) - len(processed_solutions)))
+
+        # 正式的奖励计算逻辑
+        for content, sol in zip(processed_completions, processed_solutions):
+            reward = 0.0
+
+            try:
+                # Extract answer from the solution
+                try:
+                    sol_match = re.search(r'<answer>(.*?)</answer>', sol, re.DOTALL)
+                    if sol_match:
+                        solution_answer = sol_match.group(1).strip().upper()
+                        print(f"SpatialReasoningAccuracyORM - Solution match: <answer>{sol_match.group(1)}</answer>")
+                    else:
+                        solution_answer = sol.strip().upper()
+                except Exception as e:
+                    print(f"Error in solution pattern matching: {e}")
+                    solution_answer = sol.strip().upper()
+
+                # Extract answer from completion using multiple methods in priority order
+                completion_answer = ""
+
+                # Method 1: Try standard tag format first
+                try:
+                    ans_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+                    if ans_match:
+                        completion_answer = ans_match.group(1).strip().upper()
+                        print(
+                            f"SpatialReasoningAccuracyORM - Completion match (tag): <answer>{ans_match.group(1)}</answer>")
+                except Exception as e:
+                    print(f"Error in standard tag format matching: {e}")
+
+                # Method 2: Try "The Answer is**" pattern
+                if not completion_answer:
+                    try:
+                        answer_is_pattern = re.search(r'answer is\s*\*\*\s*([A-E])\s*\*\*', content, re.IGNORECASE)
+                        if answer_is_pattern:
+                            completion_answer = answer_is_pattern.group(1).upper()
+                            print(
+                                f"SpatialReasoningAccuracyORM - Completion match (pattern): answer is **{answer_is_pattern.group(1)}**")
+                    except Exception as e:
+                        print(f"Error in 'answer is' pattern matching: {e}")
+
+                # Method 3: Try bold format as last resort
+                if not completion_answer:
+                    try:
+                        bold_match = self._extract_bold_answer(content)
+                        if bold_match and bold_match.strip():
+                            completion_answer = bold_match.upper()
+                            print(f"SpatialReasoningAccuracyORM - Completion match (bold): **{bold_match}**")
+                    except Exception as e:
+                        print(f"Error extracting bold answer: {e}")
+
+                # Method 4: Try " option is**" pattern
+                if not completion_answer:
+                    option_is_pattern = re.search(r'option is\s*\*\*\s*([A-E])\s*\*\*', content, re.IGNORECASE)
+                    if option_is_pattern:
+                        completion_answer = option_is_pattern.group(1).upper()
+                        print(
+                            f"SpatialReasoningAccuracyORM - Completion match (pattern): option is **{option_is_pattern.group(1)}**")
+
+                # Check if the answer is correct
+                if completion_answer and completion_answer == solution_answer:
+                    reward = 1.0
+
+                # Give extra points for reasoning
+                if "<think>" in content and "</think>" in content:
+                    reward += 0.1
+
+                # Cap reward at 1.0
+                reward = min(1.0, reward)
+
+            except Exception as e:
+                print(f"Error in reward calculation: {e}")
+                print(f"Content type: {type(content)}, Content: {content[:100]}...")
+                print(f"Solution type: {type(sol)}, Solution: {sol[:100]}...")
+                reward = 0.0
+
+            rewards.append(reward)
+
+        return rewards
+
+    def _extract_bold_answer(self, text):
+        """
+        Extract answer from bold format like **A**, **B**, **C**, **D**, **E**
+        Returns the LAST bold letter found in the text.
+
+        Args:
+            text (str): The text to extract bold answer from
+
+        Returns:
+            str: The extracted answer letter or empty string if not found
+        """
+        try:
+            if not isinstance(text, str):
+                return ""
+
+            if not text:
+                return ""
+
+            # 匹配 Markdown 加粗格式：**X** 其中 X 是一个字母
+            result = ""
+            try:
+                bold_pattern = r'\*\*([A-E])\*\*'
+                matches = re.findall(bold_pattern, text)
+                if matches and len(matches) > 0:
+                    last_match = matches[-1]
+                    print(f"_extract_bold_answer - Found last bold match: **{last_match}**")
+                    result = last_match
+            except Exception as e:
+                print(f"Error in first pattern matching: {e}")
+
+            # 如果第一种模式没有匹配到，尝试匹配更宽松的格式
+            if not result:
+                try:
+                    bold_pattern_loose = r'\*\*\s*([A-E])\s*\*\*'
+                    matches = re.findall(bold_pattern_loose, text)
+                    if matches and len(matches) > 0:
+                        last_match = matches[-1]
+                        print(f"_extract_bold_answer - Found last loose bold match: **{last_match}**")
+                        result = last_match
+                except Exception as e:
+                    print(f"Error in second pattern matching: {e}")
+
+            return result
+        except Exception as e:
+            print(f"Unexpected error in _extract_bold_answer: {e}")
+            return ""
+
+
 orms = {
     'toolbench': ReactORM,
     'math': MathORM,
@@ -379,4 +694,7 @@ orms = {
     'react_format': ReActFormat,
     'cosine': CosineReward,
     'repetition': RepetitionPenalty,
+    'spatial_reasoning_strict_format': SpatialReasoningStrictFormat,
+    'spatial_reasoning_loose_format': SpatialReasoningLooseFormat,
+    'spatial_reasoning_acc': SpatialReasoningAccuracyORM,
 }

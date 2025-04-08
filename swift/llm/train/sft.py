@@ -115,7 +115,17 @@ class SwiftSft(SwiftPipeline, TunerMixin):
             append_to_jsonl(val_dataset_path, val_dataset.to_list())
             logger.info(f'The split dataset from the training set will be saved at: {val_dataset_path}.')
         if args.task_type == 'seq_cls' and isinstance(train_dataset, HfDataset) and 'label' in train_dataset.features:
-            min_num_labels = int(max(train_dataset['label']) + 1)
+            if getattr(args, 'use_max_label_value', False):
+                # 处理嵌套的标签列表，找出最大值
+                all_labels = []
+                for label_list in train_dataset['label']:
+                    if isinstance(label_list, list):
+                        all_labels.extend(label_list)
+                    else:
+                        all_labels.append(label_list)
+                min_num_labels = int(max(all_labels) + 1)
+            else:
+                min_num_labels = int(max(train_dataset['label']) + 1)
             assert args.num_labels >= min_num_labels, (
                 f'args.num_labels: {args.num_labels}, min_num_labels: {min_num_labels}')
 

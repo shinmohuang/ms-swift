@@ -268,7 +268,8 @@ class Template(ProcessorMixin):
         encoded = self._encode(inputs)
         encoded.pop('labels', None)
         if inputs.label is not None:
-            encoded['labels'] = int(inputs.label)
+            # 支持多个标签的情况
+            encoded['labels'] = inputs.label
         return encoded
 
     @torch.inference_mode()
@@ -1000,7 +1001,11 @@ class Template(ProcessorMixin):
         labels = [b.pop('labels') for b in batch if b.get('labels') is not None]
         res = self._data_collator(batch, padding_to=padding_to)
         if labels:
-            res['labels'] = torch.tensor(labels, dtype=torch.long)
+            # 支持嵌套的标签列表 (包含多个分类标签)
+            if labels and isinstance(labels[0], list):
+                res['labels'] = torch.tensor(labels, dtype=torch.long)
+            else:
+                res['labels'] = torch.tensor(labels, dtype=torch.long)
         return res
 
     def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:

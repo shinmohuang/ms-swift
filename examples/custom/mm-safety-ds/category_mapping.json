@@ -1,0 +1,31 @@
+{
+  "safety_rating_map": {
+    "Safe": 0,
+    "Unsafe": 1
+  },
+  "text_category_map": {
+    "NA: None to Apply": 0,
+    "harassment": 1,
+    "harassment_threatening": 2,
+    "hate": 3,
+    "hate_threatening": 4,
+    "illicit": 5,
+    "illicit_violent": 6,
+    "self_harm": 7,
+    "self_harm_instructions": 8,
+    "self_harm_intent": 9,
+    "sexual": 10,
+    "sexual_minors": 11,
+    "violence": 12,
+    "violence_graphic": 13
+  },
+  "img_category_map": {
+    "NA: None to Apply": 0,
+    "self_harm": 1,
+    "self_harm_instructions": 2,
+    "self_harm_intent": 3,
+    "sexual": 4,
+    "violence": 5,
+    "violence_graphic": 6
+  }
+}

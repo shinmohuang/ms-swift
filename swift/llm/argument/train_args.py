@@ -140,6 +140,7 @@ class TrainArguments(SwanlabArguments, TorchAccArguments, TunerArguments, Seq2Se
         temperature (float): Temperature for sampling. Default is 0.
         optimizer (Optional[str]): Optimizer type to use, define it in the plugin package. Default is None.
         metric (Optional[str]): Metric to use for evaluation, define it in the plugin package. Default is None.
+        use_max_label_value (bool): Flag to handle nested label lists by finding the maximum value across all elements. Default is False.
     """
     add_version: bool = True
     resume_only_model: bool = False
@@ -149,6 +150,7 @@ class TrainArguments(SwanlabArguments, TorchAccArguments, TunerArguments, Seq2Se
     # dataset
     packing: bool = False
     lazy_tokenize: Optional[bool] = None
+    use_max_label_value: bool = False
 
     # plugin
     external_plugins: List[str] = field(default_factory=list)
