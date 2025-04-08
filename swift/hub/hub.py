@@ -294,7 +294,8 @@ class MSHub(HubOperation):
             split=split,
             version=revision,
             download_mode=download_mode,
-            use_streaming=streaming)
+            use_streaming=streaming,
+            trust_remote_code=True)
 
     @classmethod
     def download_model(cls,
@@ -394,7 +395,7 @@ class HFHub(HubOperation):
         if revision is None or revision == 'master':
             revision = 'main'
         return api.upload_folder(
-            repo_id,
+            repo_id=repo_id,
             folder_path=folder_path,
             path_in_repo=path_in_repo,
             commit_message=commit_message,

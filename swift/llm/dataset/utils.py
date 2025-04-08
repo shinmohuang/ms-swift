@@ -1,141 +1,54 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
-# Part of the implementation is borrowed from huggingface/transformers.
-from typing import Any, Callable, Dict, List, Optional, Union
+import multiprocessing as mp
+import time
+from typing import Any, Callable, Dict, Optional, Union
 
 import numpy as np
 from datasets import Dataset as HfDataset
 from torch.utils.data import Dataset, IterableDataset
+from tqdm import tqdm
 
 from swift.utils import get_logger
 from ..template import MaxLengthError
-from .preprocessor import DATASET_TYPE, RowPreprocessor
+from .preprocessor import RowPreprocessor
 
 logger = get_logger()
 
 
-def sample_dataset(dataset: HfDataset,
-                   dataset_sample: Optional[int],
-                   random_state: Optional[np.random.RandomState] = None) -> HfDataset:
+def sample_dataset(
+    dataset: HfDataset,
+    dataset_sample: Optional[int],
+    shuffle: bool = True,
+    random_state: Optional[np.random.RandomState] = None,
+) -> HfDataset:
     """Sample dataset by a dataset_sample number
     Args:
         dataset: The dataset instance, iterable dataset is not supported
         dataset_sample: The sample number
+        shuffle: Whether to perform random sampling on non-streaming datasets
         random_state: The random state
     Returns:
         The sampled dataset
     """
     if dataset_sample is None:
         return dataset
-    if random_state is None:
-        random_state = np.random.RandomState()
 
     n_repeat_sample = dataset_sample // len(dataset)
-    n_random_sample = dataset_sample % len(dataset)
-    if n_repeat_sample >= 1 and n_random_sample >= 1:
+    n_remain_sample = dataset_sample % len(dataset)
+    if n_repeat_sample >= 1 and n_remain_sample >= 1:
         logger.warning(f'dataset_sample:{dataset_sample} is greater than len(dataset):{len(dataset)}, '
                        'repeated sampling will be performed.')
     idx = np.tile(range(len(dataset)), n_repeat_sample)
-    if n_random_sample >= 1:
-        idx_random = random_state.permutation(len(dataset))[:n_random_sample]
-        idx = np.concatenate([idx, idx_random])
+    if n_remain_sample >= 1:
+        if shuffle:
+            if random_state is None:
+                random_state = np.random.RandomState()
+            idx_remain = random_state.permutation(len(dataset))[:n_remain_sample]
+        else:
+            idx_remain = np.arange(n_remain_sample)
+        idx = np.concatenate([idx, idx_remain])
     dataset = dataset.select(idx)
     return dataset
-
-
-# Code borrowed from trl
-class ConstantLengthDataset(IterableDataset):
-    """This class wraps to do dataset packing
-    Args:
-        template: The template
-        dataset: The dataset instance
-        seq_length: The permitted sequence length
-        num_of_sequences: Used to calculate the max_buffer_size fetched one time
-        chars_per_token: Gives the chars per token, 3.6 if the default one, comes from `trl`
-        append_concat_token: Reserved argument
-        add_special_tokens: Reserved argument
-    """
-
-    def __init__(
-        self,
-        template: 'Template',
-        dataset: DATASET_TYPE,
-        seq_length=1024,
-        num_of_sequences=1024,
-        chars_per_token=3.6,
-        append_concat_token=True,
-        add_special_tokens=True,
-    ):
-        self.template = template
-        self.concat_token_id = self.template.tokenizer.eos_token_id
-        self.dataset = dataset
-        self.seq_length = seq_length
-        self.max_buffer_size = seq_length * chars_per_token * num_of_sequences
-        self.append_concat_token = append_concat_token
-        self.add_special_tokens = add_special_tokens
-
-    @staticmethod
-    def get_packed_dataset(template: 'Template',
-                           dataset: DATASET_TYPE,
-                           seq_length=1024,
-                           num_of_sequences=2048,
-                           chars_per_token=3.6,
-                           append_concat_token=True,
-                           add_special_tokens=True):
-        constant_length_iterator = ConstantLengthDataset(template, dataset, seq_length, num_of_sequences,
-                                                         chars_per_token, append_concat_token, add_special_tokens)
-
-        dataset_list = []
-        for item in constant_length_iterator:
-            dataset_list.append(item)
-        return dataset_list
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def calculate_matched_group(self, sequences: Dict[str, List[int]]):
-        # https://arxiv.org/pdf/2404.10830
-        import binpacking
-        binpacked = binpacking.to_constant_volume(sequences, self.seq_length, weight_pos=1)
-        packed_sequence = []
-        for sequence in binpacked:
-            packed = {}
-            position_id_lengths = [len(s[0]['input_ids']) for s in sequence]
-            for key in sequence[0][0].keys():
-                packed[key] = np.concatenate([s[0][key] for s in sequence])
-            packed_sequence.append(packed)
-            packed['position_ids'] = np.concatenate([list(range(pil)) for pil in position_id_lengths])
-        return packed_sequence
-
-    def __iter__(self):
-        iterator = iter(self.dataset)
-        more_examples = True
-        while more_examples:
-            buffer, buffer_len = [], 0
-            while True:
-                if buffer_len >= self.max_buffer_size:
-                    break
-                try:
-                    example = next(iterator)
-                    lens = sum([len(value) if value else 0 for value in example.values()])
-                    buffer.append(example)
-                    buffer_len += lens
-                except StopIteration:
-                    more_examples = False
-                    break
-
-            sequences = []
-            for example in buffer:
-                try:
-                    inputs = self.template.encode(example)
-                except MaxLengthError:
-                    continue
-                sequences.append((inputs, len(inputs['input_ids'])))
-
-            if not sequences:
-                return
-            packed_sequences = self.calculate_matched_group(sequences)
-            for sequence in packed_sequences:
-                yield sequence
 
 
 class LazyLLMDataset(Dataset):
@@ -195,6 +108,165 @@ class LazyLLMDataset(Dataset):
         return len(self.dataset)
 
 
+class BasePackingDataset:
+
+    def __init__(self, template, dataset, num_workers: int = 1, *, packing_interval: int = 128, strict: bool = False):
+        template._packing = True
+        self.template = template
+        self.dataset = dataset
+        self.num_workers = num_workers
+        self.packing_interval = packing_interval
+        self.strict = strict
+        assert num_workers >= 1, f'num_workers: {num_workers}'
+        self.workers = []
+
+    @staticmethod
+    def calculate_matched_group(template, sequences, is_finished: bool = True):
+        if len(sequences) == 0:
+            return [], []
+        # https://arxiv.org/pdf/2404.10830
+        import binpacking
+        sequences = binpacking.to_constant_volume(sequences, template.max_length, weight_pos=1)
+        res = []
+        if sequences and not is_finished:
+            sequences, ret_sequences = sequences[:-1], sequences[-1]
+        else:
+            ret_sequences = []
+        for row in sequences:
+            packed = template.packing_row(row)
+            res.append(packed)
+        return res, ret_sequences
+
+    def _encode_data(self, data):
+        res = None
+        try:
+            res = self.template.encode(data)
+        except Exception as e:
+            if self.strict and not isinstance(e, MaxLengthError):
+                raise
+        return res
+
+
+class PackingDataset(BasePackingDataset, Dataset):
+
+    def __init__(self, template, dataset, num_workers: int = 1, *, packing_interval: int = 128, strict: bool = False):
+        super().__init__(template, dataset, num_workers, packing_interval=packing_interval, strict=strict)
+        self.prog_bar = tqdm(total=len(dataset), dynamic_ncols=True, desc='Packing')
+        self._queue = mp.Queue()
+        self._terminated_workers = 0
+        for i in range(self.num_workers):
+            shard_dataset = self.dataset.shard(self.num_workers, i)
+            worker = mp.Process(target=self._producer, args=(shard_dataset, ), daemon=True)
+            worker.start()
+            self.workers.append(worker)
+
+        self.packed_dataset = self.get_packed_dataset()
+        self.prog_bar.close()
+        for worker in self.workers:
+            worker.terminate()
+
+    def fetch_packing_data(self, res: Optional[list] = None):
+        res = res or []
+        for _ in range(self.packing_interval):
+            data = self._queue.get()
+            if data is None:
+                self._terminated_workers += 1
+                if self._terminated_workers == self.num_workers:
+                    break
+                continue
+            self.prog_bar.update(1)
+            if data:
+                res.append((data, len(data['input_ids'])))
+        return res
+
+    def get_packed_dataset(self):
+        data = []
+        result = []
+        while True:
+            data = self.fetch_packing_data(data)
+            is_finished = self._terminated_workers == self.num_workers
+            res, data = self.calculate_matched_group(self.template, data, is_finished=is_finished)
+            result += res
+            if is_finished:
+                break
+        return result
+
+    def _producer(self, shard_dataset):
+        for data in shard_dataset:
+            encoded_data = self._encode_data(data) or {}  # ignore
+            self._queue.put(encoded_data)
+        self._queue.put(None)
+        while True:
+            # Wait for the main process to terminate to avoid fd anomalies.
+            time.sleep(0.1)
+
+    def __getitem__(self, index):
+        return self.packed_dataset[index].copy()
+
+    def __len__(self):
+        return len(self.packed_dataset)
+
+
+class IterablePackingDataset(BasePackingDataset, IterableDataset):
+
+    def __init__(
+        self,
+        template,
+        dataset,
+        num_workers: int = 1,
+        *,
+        packing_interval: int = 128,
+        strict: bool = False,
+    ):
+        super().__init__(template, dataset, num_workers, packing_interval=packing_interval, strict=strict)
+        self._in_queue = mp.Queue()
+        self._out_queue = mp.Queue()
+        self.workers = []
+
+    def _processor(self):
+        while True:
+            data = self._in_queue.get()
+            encoded_data = self._encode_data(data)
+            self._out_queue.put(encoded_data)
+
+    def _put_data_in_queue(self, iterator):
+        for _ in range(self.packing_interval):
+            data = next(iterator)
+            self._in_queue.put(data)
+
+    def _fetch_data_out_queue(self, res):
+        for _ in range(self.packing_interval):
+            data = self._out_queue.get()
+            if data is None:
+                continue
+            res.append((data, len(data['input_ids'])))
+        return res
+
+    @staticmethod
+    def cyclic_iter(iterable):
+        while True:
+            for x in iterable:
+                yield x
+
+    def __iter__(self):
+        if not self.workers:
+            for _ in range(self.num_workers):
+                worker = mp.Process(target=self._processor, daemon=True)
+                worker.start()
+                self.workers.append(worker)
+        try:
+            next(iter(self.dataset))
+        except StopIteration:
+            return
+        iterator = self.cyclic_iter(self.dataset)
+        data = []
+        while True:
+            self._put_data_in_queue(iterator)
+            data = self._fetch_data_out_queue(data)
+            res, data = self.calculate_matched_group(self.template, data, is_finished=False)
+            yield from res
+
+
 class EncodePreprocessor(RowPreprocessor):
 
     def __init__(self, template: 'Template'):
@@ -205,20 +277,7 @@ class EncodePreprocessor(RowPreprocessor):
         return self.template.encode(row)
 
 
-class PackingPreprocessor(EncodePreprocessor):
-
-    def batched_preprocess(self, batched_row: Dict[str, Any], **kwargs) -> Dict[str, Any]:
-        subset = self.batched_to_rows(batched_row)
-        packed_dataset = ConstantLengthDataset.get_packed_dataset(
-            self.template, dataset=subset, seq_length=self.template.max_length, num_of_sequences=4096)
-        batched_row = self.rows_to_batched(packed_dataset)
-        return batched_row
-
-
 class GetLengthPreprocessor(RowPreprocessor):
-
-    def __init__(self):
-        super().__init__()
 
     def preprocess(self, row):
         length = max([len(row[k]) for k in row.keys() if k.endswith('input_ids')])

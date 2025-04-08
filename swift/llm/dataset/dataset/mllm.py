@@ -740,6 +740,17 @@ class TextCapsPreprocessor(ResponsePreprocessor):
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         row['query'] = 'What is the caption of this image?'
+        if not os.path.exists(row['images']['path']):
+            return None
+        return super().preprocess(row)
+
+
+class TextCapsEmbPreprocessor(ResponsePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        row['query'] = ''
+        if not os.path.exists(row['images']['path']):
+            return None
         return super().preprocess(row)
 
 
@@ -747,8 +758,18 @@ register_dataset(
     DatasetMeta(
         ms_dataset_id='swift/TextCaps',
         hf_dataset_id='HuggingFaceM4/TextCaps',
-        preprocess_func=TextCapsPreprocessor(columns={'reference_strs': 'response'}),
-        split=['train', 'validation'],
+        subsets=[
+            SubsetDataset(
+                name='default',
+                preprocess_func=TextCapsPreprocessor(columns={'reference_strs': 'response'}),
+                split=['train', 'validation'],
+            ),
+            SubsetDataset(
+                name='emb',
+                preprocess_func=TextCapsEmbPreprocessor(columns={'reference_strs': 'response'}),
+                split=['train', 'validation'],
+            ),
+        ],
         huge_dataset=True,
         tags=['multi-modal', 'en', 'caption', 'quality']))
 
@@ -1174,3 +1195,21 @@ register_dataset(
         split=['train', 'validation'],
         preprocess_func=CapchaImagesPreprocessor(columns={'solution': 'response'}),
         tags=['chat', 'multi-modal', 'vision']))
+
+
+class ClevrPreprocessor(ResponsePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        query = row.get('query', '')
+        query = (f'{query} Output the thinking process in <think> </think> and '
+                 'final answer (number) in <answer> </answer> tags.')
+        row.update({'query': query})
+        return super().preprocess(row)
+
+
+register_dataset(
+    DatasetMeta(
+        ms_dataset_id='okwinds/clevr_cogen_a_train',
+        hf_dataset_id='leonardPKU/clevr_cogen_a_train',
+        preprocess_func=ClevrPreprocessor(),
+        tags=['qa', 'math', 'vision', 'grpo']))

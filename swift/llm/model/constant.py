@@ -10,6 +10,7 @@ class LLMModelType:
     qwen2_5 = 'qwen2_5'
     qwen2_5_math = 'qwen2_5_math'
     qwen2_moe = 'qwen2_moe'
+    qwq_preview = 'qwq_preview'
     qwq = 'qwq'
 
     qwen2_gte = 'qwen2_gte'
@@ -88,10 +89,12 @@ class LLMModelType:
 
     gemma = 'gemma'
     gemma2 = 'gemma2'
+    gemma3_text = 'gemma3_text'
 
     skywork = 'skywork'
     skywork_o1 = 'skywork_o1'
 
+    ling = 'ling'
     yuan2 = 'yuan2'
     orion = 'orion'
     xverse = 'xverse'
@@ -127,8 +130,10 @@ class MLLMModelType:
     qwen_audio = 'qwen_audio'
     qwen2_vl = 'qwen2_vl'
     qwen2_5_vl = 'qwen2_5_vl'
+    qwen2_5_omni = 'qwen2_5_omni'
     qwen2_audio = 'qwen2_audio'
     qvq = 'qvq'
+    qwen2_gme = 'qwen2_gme'
     ovis1_6 = 'ovis1_6'
     ovis1_6_llama3 = 'ovis1_6_llama3'
     ovis2 = 'ovis2'
@@ -152,6 +157,7 @@ class MLLMModelType:
     xcomposer2_5_ol_audio = 'xcomposer2_5_ol_audio'
 
     llama3_2_vision = 'llama3_2_vision'
+    llama4 = 'llama4'
     llama3_1_omni = 'llama3_1_omni'
 
     llava1_5_hf = 'llava1_5_hf'
@@ -198,6 +204,7 @@ class MLLMModelType:
     step_audio = 'step_audio'
 
     phi3_vision = 'phi3_vision'
+    phi4_multimodal = 'phi4_multimodal'
     florence = 'florence'
     idefics3 = 'idefics3'
     paligemma = 'paligemma'
@@ -206,6 +213,8 @@ class MLLMModelType:
     pixtral = 'pixtral'
     megrez_omni = 'megrez_omni'
     valley = 'valley'
+    gemma3_vision = 'gemma3_vision'
+    mistral_2503 = 'mistral_2503'
 
 
 class ModelType(LLMModelType, MLLMModelType, BertModelType, RMModelType):

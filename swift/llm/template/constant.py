@@ -12,6 +12,7 @@ class LLMTemplateType:
     qwen2_5 = 'qwen2_5'
     qwen2_5_math = 'qwen2_5_math'
     qwen2_5_math_prm = 'qwen2_5_math_prm'
+    qwq_preview = 'qwq_preview'
     qwq = 'qwq'
     marco_o1 = 'marco_o1'
     modelscope_agent = 'modelscope_agent'
@@ -66,9 +67,11 @@ class LLMTemplateType:
     wizardlm2 = 'wizardlm2'
     wizardlm2_moe = 'wizardlm2_moe'
     gemma = 'gemma'
+    gemma3_text = 'gemma3_text'
     phi3 = 'phi3'
     phi4 = 'phi4'
 
+    ling = 'ling'
     yuan = 'yuan'
     xverse = 'xverse'
     bluelm = 'bluelm'
@@ -89,7 +92,9 @@ class MLLMTemplateType:
     qwen_audio = 'qwen_audio'
     qwen2_vl = 'qwen2_vl'
     qwen2_5_vl = 'qwen2_5_vl'
+    qwen2_5_omni = 'qwen2_5_omni'
     qwen2_audio = 'qwen2_audio'
+    qwen2_gme = 'qwen2_gme'
     qvq = 'qvq'
     ovis1_6 = 'ovis1_6'
     ovis1_6_llama3 = 'ovis1_6_llama3'
@@ -97,6 +102,7 @@ class MLLMTemplateType:
 
     llama3_1_omni = 'llama3_1_omni'
     llama3_2_vision = 'llama3_2_vision'
+    llama4 = 'llama4'
 
     llava1_5_hf = 'llava1_5_hf'
     llava1_6_mistral_hf = 'llava1_6_mistral_hf'
@@ -161,10 +167,13 @@ class MLLMTemplateType:
     pixtral = 'pixtral'
     paligemma = 'paligemma'
     phi3_vision = 'phi3_vision'
+    phi4_multimodal = 'phi4_multimodal'
     florence = 'florence'
     molmo = 'molmo'
     megrez_omni = 'megrez_omni'
     valley = 'valley'
+    gemma3_vision = 'gemma3_vision'
+    mistral_2503 = 'mistral_2503'
 
 
 class TemplateType(LLMTemplateType, MLLMTemplateType, RMTemplateType):

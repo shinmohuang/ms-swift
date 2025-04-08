@@ -18,13 +18,13 @@ def infer_batch(engine: 'InferEngine', infer_requests: List['InferRequest']):
 def infer_stream(engine: 'InferEngine', infer_request: 'InferRequest'):
     request_config = RequestConfig(max_tokens=512, temperature=0, stream=True)
     metric = InferStats()
-    gen = engine.infer([infer_request], request_config, metrics=[metric])
+    gen_list = engine.infer([infer_request], request_config, metrics=[metric])
     query = infer_request.messages[0]['content']
     print(f'query: {query}\nresponse: ', end='')
-    for resp_list in gen:
-        if resp_list[0] is None:
+    for resp in gen_list[0]:
+        if resp is None:
             continue
-        print(resp_list[0].choices[0].delta.content, end='', flush=True)
+        print(resp.choices[0].delta.content, end='', flush=True)
     print()
     print(f'metric: {metric.compute()}')
 
@@ -122,6 +122,6 @@ if __name__ == '__main__':
     from swift.plugin import InferStats
     # NOTE: In a real deployment scenario, please comment out the context of run_deploy.
     with run_deploy(
-            DeployArguments(model='Qwen/Qwen2-VL-2B-Instruct', verbose=False, log_interval=-1,
+            DeployArguments(model='Qwen/Qwen2.5-VL-3B-Instruct', verbose=False, log_interval=-1,
                             infer_backend='vllm')) as port:
         run_client(port=port)

@@ -135,7 +135,7 @@ request_config = RequestConfig(max_tokens=512, temperature=0)
 infer_requests = [
     InferRequest(messages=[{'role': 'user', 'content': 'Who are you?'}]),
     InferRequest(messages=[{'role': 'user', 'content': 'Where is the capital of Zhejiang?'},
-                           {'role': 'assistant', 'content': 'Where is the capital of Zhejiang?'},
+                           {'role': 'assistant', 'content': 'The capital of Zhejiang Province, China, is Hangzhou.'},
                            {'role': 'user', 'content': 'What are some fun places here?'}]),
 ]
 resp_list = engine.infer(infer_requests, request_config)
@@ -337,10 +337,9 @@ messages = [{'role': 'user', 'content': [
 ]}]
 infer_request = InferRequest(messages=messages)
 request_config = RequestConfig(max_tokens=512, temperature=0, stream=True)
-gen = engine.infer([infer_request], request_config, metrics=[metric])
+gen_list = engine.infer([infer_request], request_config, metrics=[metric])
 print(f'response0: ', end='')
-for chunk_list in gen:
-    chunk = chunk_list[0]
+for chunk in gen_list[0]:
     if chunk is None:
         continue
     print(chunk.choices[0].delta.content, end='', flush=True)

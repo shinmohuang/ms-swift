@@ -327,16 +327,47 @@ class StsbPreprocessor(ResponsePreprocessor):
 
     def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
         row = {
-            'response': row['sentence1'],
-            'rejected_response': row['sentence2'],
+            'query': row['sentence1'],
+            'response': row['sentence2'],
             'label': row['score'],
         }
         return super().preprocess(row)
 
 
+class StsbGeneratePreprocessor(ResponsePreprocessor):
+    prompt = """Task: Based on the given two sentences, provide a similarity score between 0.0 and 1.0.
+Sentence 1: {text1}
+Sentence 2: {text2}
+Similarity score: """
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return super().preprocess({
+            'query': self.prompt.format(text1=row['sentence1'], text2=row['sentence2']),
+            'response': f"{row['score']:.1f}"
+        })
+
+
+class StsbRegressionPreprocessor(StsbGeneratePreprocessor):
+
+    def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return super(StsbGeneratePreprocessor, self).preprocess({
+            'query':
+            self.prompt.format(text1=row['sentence1'], text2=row['sentence2']),
+            'label':
+            row['score']
+        })
+
+
 register_dataset(
     DatasetMeta(
-        ms_dataset_id='sentence-transformers/stsb', preprocess_func=StsbPreprocessor(), tags=['similarity', '🔥']))
+        ms_dataset_id='sentence-transformers/stsb',
+        hf_dataset_id='sentence-transformers/stsb',
+        subsets=[
+            SubsetDataset('default', preprocess_func=StsbPreprocessor()),  # embedding
+            SubsetDataset('generate', preprocess_func=StsbGeneratePreprocessor()),
+            SubsetDataset('reg', preprocess_func=StsbRegressionPreprocessor()),
+        ],
+        tags=['similarity', '🔥']))
 
 
 def _repair_conversations_agent_instruct(s: str) -> List[Dict[str, Any]]:
@@ -358,8 +389,7 @@ class MultiRoleAgentPreprocessor(RowPreprocessor):
 
     def preprocess(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         conv = row['conversations']
-        res_prompt = """\n\n【注意事项】\n1. 这是聊天室，不要发送私信给任何人\n2. 仅代表你个人说话,不要扮演其他人，
-        只根据对话历史进行回复\n3. 长话短说，不要说太多话，不要超过50字 """
+        res_prompt = '\n\n【注意事项】\n1. 这是聊天室，不要发送私信给任何人\n2. 仅代表你个人说话,不要扮演其他人，只根据对话历史进行回复\n3. 长话短说，不要说太多话，不要超过50字 '
         history_prompt = '\n\n【chat history】'
         conv_prompt = '\n {name}:{content}'
         query, response = '', conv[-1]['value']
@@ -423,10 +453,10 @@ class CoundownTaskPreprocessor(ResponsePreprocessor):
     def preprocess(self, row: Dict[str, Any]) -> Dict[str, Any]:
         numbers = row['nums']
         target = row.pop('response', None)
-        query = f"""Using the numbers {numbers}, create an equation that equals {target}.
-You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.
-Show your work in <think> </think> tags. And return the final equation and answer in <answer> </answer> tags,
-for example <answer> (1 + 2) / 3 * 4 = 4 </answer>."""
+        query = (f'Using the numbers {numbers}, create an equation that equals {target}.\n'
+                 'You can use basic arithmetic operations (+, -, *, /) and each number can only be used once.\n'
+                 'Show your work in <think> </think> tags. And return the final equation and answer '
+                 'in <answer> </answer> tags, for example <answer> (1 + 2) / 3 * 4 = 4 </answer>.')
         row.update({'target': target, 'query': query})
         return super().preprocess(row)
 

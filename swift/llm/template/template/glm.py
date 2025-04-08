@@ -91,6 +91,7 @@ register_template(
 
 
 class CogTemplate(Template):
+    placeholder_tokens = ['<|reserved_special_token_0|>']
 
     use_model = True
 
@@ -113,10 +114,10 @@ class CogTemplate(Template):
         if labels is not None:
             encoded['labels'] = labels[:1] + [-100] * image_token_len + labels[1:]
         if len(image) > 0:
-            encoded['images'] = [[img.to(dtype=self.config.torch_dtype)] for img in inputs2['images']]
+            encoded['images'] = [[img.to(dtype=self.model_info.torch_dtype)] for img in inputs2['images']]
             if 'cross_images' in inputs2:
                 # is cogagent
-                encoded['cross_images'] = [[cross_img.to(dtype=self.config.torch_dtype)]
+                encoded['cross_images'] = [[cross_img.to(dtype=self.model_info.torch_dtype)]
                                            for cross_img in inputs2['cross_images']]
         return encoded
 
@@ -158,9 +159,7 @@ class CogVLMTemplateMeta(TemplateMeta):
 
 register_template(CogVLMTemplateMeta(MLLMTemplateType.cogvlm, template_cls=CogTemplate))
 
-register_template(
-    CogVLMTemplateMeta(
-        MLLMTemplateType.cogvlm2, template_cls=CogTemplate, placeholder_tokens=['<|reserved_special_token_0|>']))
+register_template(CogVLMTemplateMeta(MLLMTemplateType.cogvlm2, template_cls=CogTemplate))
 
 
 class Cog2VideoTemplate(CogTemplate):
@@ -191,15 +190,14 @@ class Cog2VideoTemplate(CogTemplate):
         return encoded
 
 
-register_template(
-    CogVLMTemplateMeta(
-        MLLMTemplateType.cogvlm2_video,
-        template_cls=Cog2VideoTemplate,
-        placeholder_tokens=['<|reserved_special_token_0|>'],
-    ))
+register_template(CogVLMTemplateMeta(
+    MLLMTemplateType.cogvlm2_video,
+    template_cls=Cog2VideoTemplate,
+))
 
 
 class GLMEdgeVTemplate(Template):
+    placeholder_tokens = ['<|begin_of_image|>']
 
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
@@ -222,5 +220,4 @@ register_template(
         system_prefix=['<|system|>\\n{{SYSTEM}}\\n'],
         suffix=['<|endoftext|>'],
         template_cls=GLMEdgeVTemplate,
-        placeholder_tokens=['<|begin_of_image|>'],
     ))

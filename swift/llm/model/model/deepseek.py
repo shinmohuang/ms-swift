@@ -73,7 +73,6 @@ register_model(
         TemplateType.deepseek,
         get_model_tokenizer_deepseek_moe,
         architectures=['DeepseekForCausalLM'],
-        model_arch=ModelArch.llama,
     ))
 
 register_model(
@@ -107,6 +106,7 @@ register_model(
                 Model('deepseek-ai/DeepSeek-V2.5-1210', 'deepseek-ai/DeepSeek-V2.5-1210'),
                 Model('deepseek-ai/DeepSeek-V3-Base', 'deepseek-ai/DeepSeek-V3-Base'),
                 Model('deepseek-ai/DeepSeek-V3', 'deepseek-ai/DeepSeek-V3'),
+                Model('deepseek-ai/DeepSeek-V3-0324', 'deepseek-ai/DeepSeek-V3-0324'),
             ]),
             ModelGroup([
                 Model('cognitivecomputations/DeepSeek-V3-awq', 'cognitivecomputations/DeepSeek-V3-AWQ'),

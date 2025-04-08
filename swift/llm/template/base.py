@@ -1,8 +1,10 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import hashlib
 import inspect
+import math
 import os
 import re
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict
 from functools import partial, wraps
@@ -40,6 +42,7 @@ class Template(ProcessorMixin):
     video_placeholder = ['<video>']
     audio_placeholder = ['<audio>']
     cot_process_placeholder = ['ки']
+    placeholder_tokens = []  # For clearer printing
     load_images = True
     skip_prompt = True
     use_model = False
@@ -59,6 +62,7 @@ class Template(ProcessorMixin):
         max_pixels: Optional[int] = None,
         tools_prompt: Optional[str] = None,
         norm_bbox: Literal['norm1000', 'none', None] = None,
+        response_prefix: Optional[str] = None,
         # only for train
         padding_side: Literal['left', 'right'] = 'right',
         loss_scale: str = 'default',
@@ -93,7 +97,12 @@ class Template(ProcessorMixin):
         template_meta.check_system(default_system)
         if default_system is not None:
             template_meta.default_system = default_system
+        if response_prefix is not None:
+            template_meta.response_prefix = response_prefix
 
+        for i, token in enumerate(self.placeholder_tokens):
+            if isinstance(token, str):
+                self.placeholder_tokens[i] = tokenizer.convert_tokens_to_ids(token)
         template_meta.init(tokenizer)
 
         self.template_meta: TemplateMeta = template_meta
@@ -109,10 +118,11 @@ class Template(ProcessorMixin):
         self.norm_bbox = norm_bbox or self.norm_bbox
         if self.is_encoder_decoder:
             self.skip_prompt = False
-
         self.mode: Literal['pt', 'vllm', 'lmdeploy',  # infer
                            'train', 'rlhf', 'kto',  # train
                            'seq_cls', 'embedding', 'prm'] = 'pt'
+        self._packing = False
+        self.use_megatron = False
         if self.model_info.task_type != 'causal_lm':
             self.mode = self.model_info.task_type
         self._handles = []
@@ -211,17 +221,22 @@ class Template(ProcessorMixin):
     @staticmethod
     def _replace_image_tags(inputs: StdTemplateInputs):
         # compat
+        if inputs.images:
+            return
         images = []
         pattern = r'<img>(.+?)</img>'
         for message in inputs.messages:
             content = message['content']
             if not isinstance(content, str):
                 continue
-            images += re.findall(pattern, content)
+            for image in re.findall(pattern, content):
+                # only support local_path
+                if os.path.isfile(image):
+                    images.append(image)
+                else:
+                    logger.warning_once(f'Failed to parse image path: `{content}`.', hash_id='<img></img>')
             message['content'] = re.sub(pattern, '<image>', content)
-        if images:
-            assert not inputs.images, f'images: {images}, inputs.images: {inputs.images}'
-            inputs.images = images
+        inputs.images = images
 
     @staticmethod
     def _replace_start_image_tags(inputs: StdTemplateInputs):
@@ -233,6 +248,22 @@ class Template(ProcessorMixin):
             generate_mode = True
             message['content'] = message['content'][:-len('<start-image>')]  # remove the <start-image>
         inputs.generate_mode = generate_mode
+
+    @staticmethod
+    def _extend_tokens(input_ids: List[int], labels: Optional[List[int]], replace_idx_list: List[int],
+                       get_new_tokens: Callable[[int], List[int]]) -> Tuple[List[int], Optional[List[int]]]:
+        added_tokens_len = 0
+        for i, idx in enumerate(replace_idx_list):
+            new_tokens = get_new_tokens(i)
+            token_len = len(new_tokens)
+            input_ids = input_ids[:idx + added_tokens_len] + new_tokens + input_ids[added_tokens_len + idx + 1:]
+            if labels:
+                labels = labels[:idx + added_tokens_len] + [-100] * token_len + labels[added_tokens_len + idx + 1:]
+            added_tokens_len += token_len - 1
+        return input_ids, labels
+
+    def compute_loss_context(self, model, inputs):
+        return nullcontext()
 
     def _rlhf_encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         chosen_inputs, rejected_inputs = inputs, deepcopy(inputs)
@@ -255,14 +286,56 @@ class Template(ProcessorMixin):
         return encoded
 
     def _embedding_encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
-        encoded = self._rlhf_encode(inputs)
-        encoded.pop('chosen_labels', None)
-        encoded.pop('rejected_labels', None)
-        if inputs.label is not None:
-            encoded['labels'] = float(inputs.label)
-        else:
-            encoded['labels'] = 0.0
-        return encoded
+        _encoded = {}
+        labels = []
+
+        def split_multi_medias(_inputs):
+            _content = _inputs.messages[-2]['content']
+            image_size = len(re.findall('<image>', _content))
+            video_size = len(re.findall('<video>', _content))
+            audio_size = len(re.findall('<audio>', _content))
+            _inputs.images = inputs.images[:image_size]
+            assert len(_inputs.images) == image_size
+            inputs.images = inputs.images[image_size:]
+            _inputs.videos = inputs.videos[:video_size]
+            assert len(_inputs.videos) == video_size
+            inputs.videos = inputs.videos[video_size:]
+            _inputs.audios = inputs.audios[:audio_size]
+            assert len(_inputs.audios) == audio_size
+            inputs.audios = inputs.audios[audio_size:]
+
+        anchor = deepcopy(inputs)
+        anchor.messages[-1]['content'] = ''
+        anchor.rejected_response = []
+        split_multi_medias(anchor)
+        anchor_encoded = self._encode(anchor)
+        for key in anchor_encoded:
+            _encoded[f'anchor_{key}'] = anchor_encoded[key]
+
+        positive = deepcopy(inputs)
+        positive.messages[-2]['content'] = positive.messages[-1]['content']
+        positive.messages[-1]['content'] = ''
+        positive.rejected_response = []
+        split_multi_medias(positive)
+        positive_encoded = self._encode(positive)
+        for key in positive_encoded:
+            _encoded[f'positive_{key}'] = positive_encoded[key]
+        labels.append(float(inputs.label) if inputs.label is not None else 1.0)
+
+        rejected_len = len(inputs.rejected_response) if inputs.rejected_response else 0
+        for i in range(rejected_len):
+            negative = deepcopy(inputs)
+            negative.messages[-2]['content'] = negative.rejected_response[i]
+            negative.messages[-1]['content'] = ''
+            negative.rejected_response = []
+            split_multi_medias(negative)
+            negative_encoded = self._encode(negative)
+            for key in negative_encoded:
+                _encoded[f'negative{i}_{key}'] = negative_encoded[key]
+            labels.append(0.0)
+
+        _encoded['labels'] = labels
+        return _encoded
 
     def _seq_cls_encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = self._encode(inputs)
@@ -313,7 +386,33 @@ class Template(ProcessorMixin):
                 encoded.pop(key)
         if return_template_inputs:
             encoded['template_inputs'] = inputs
+
+        if self.use_megatron:
+            encoded['labels'] = encoded['labels'][1:] + [-100]
+            encoded['position_ids'] = list(range(len(encoded['labels'])))
         return encoded
+
+    def packing_row(self, row: List[Tuple[Dict[str, Any], int]]) -> Dict[str, Any]:
+        packed = {}
+        keys = set()
+        for r in row:
+            keys.update(r[0].keys())
+        for key in keys:
+            if key == 'labels':
+                labels_list = []
+                for x in row:
+                    labels = x[0][key]
+                    # https://github.com/huggingface/transformers/pull/31629
+                    labels[0] = -100
+                    labels_list.append(labels)
+                packed[key] = sum(labels_list, start=[])
+            elif key == 'input_ids':
+                packed[key] = sum((x[0][key] for x in row), start=[])
+        if 'position_ids' not in packed:
+            packed['position_ids'] = sum((list(range(x[1])) for x in row), start=[])
+
+        packed.update(self._data_collator_mm_data([r[0] for r in row]))
+        return packed
 
     def _post_encode(self, model: nn.Module, inputs: Dict[str, Any]) -> Dict[str, Any]:
         return inputs
@@ -330,38 +429,78 @@ class Template(ProcessorMixin):
         return generate_ids
 
     @staticmethod
-    def _get_seq_cls_logprobs(pred: int, logprobs: torch.Tensor):
-        idxs = logprobs.argsort(descending=True, dim=-1)
+    def _get_seq_cls_logprobs(pred: int, logprobs: torch.Tensor, top_logprobs: int):
+        idxs = logprobs.argsort(descending=True, dim=-1)[:top_logprobs].tolist()
+        logprobs = logprobs.tolist()
         return {
-            'content': {
+            'content': [{
                 'index': pred,
-                'logprob': logprobs[pred].item(),
+                'logprobs': [logprobs[p] for p in pred] if isinstance(pred, (list, tuple)) else logprobs[pred],
                 'top_logprobs': [{
                     'index': idx,
-                    'logprob': logprobs[idx].item()
-                } for idx in idxs.tolist()]
-            }
+                    'logprob': logprobs[idx]
+                } for idx in idxs]
+            }]
         }
 
-    def decode_seq_cls(self, logits: torch.Tensor):
+    @staticmethod
+    def _get_problem_type(config, labels=None, logits=None) -> str:
+        problem_type = config.problem_type
+        if problem_type is not None:
+            return problem_type
+        if labels is not None:
+            if isinstance(labels, (list, tuple)):
+                if labels and isinstance(labels[0], float):
+                    problem_type = 'regression'
+                else:
+                    problem_type = 'multi_label_classification'
+            else:
+                problem_type = 'single_label_classification'
+                assert config.num_labels >= labels + 1
+        if logits is not None:
+            if logits.shape[-1] == 1:
+                problem_type = 'regression'
+            else:
+                problem_type = 'single_label_classification'  # compatible with older versions
+        assert problem_type is not None
+        config.problem_type = problem_type
+        return problem_type
+
+    def decode_seq_cls(self, logits: torch.Tensor, top_logprobs: int):
         assert isinstance(logits, torch.Tensor)
-        if logits.shape[-1] > 1:
-            preds = torch.argmax(logits, dim=-1).tolist()
-            logprobs = torch.log_softmax(logits, -1)
-            logprobs = [self._get_seq_cls_logprobs(pred, logprobs[i]) for i, pred in enumerate(preds)]
-        else:
+        problem_type = self._get_problem_type(self.config, logits=logits)
+        if problem_type == 'regression':
             preds = logits.squeeze(dim=-1).tolist()
             logprobs = [None] * len(preds)
+        else:
+            if problem_type == 'single_label_classification':
+                preds = torch.argmax(logits, dim=-1).tolist()
+                logprobs = torch.log_softmax(logits, -1)
+            else:
+                preds = [(logprob >= 0.5).nonzero(as_tuple=True)[0].tolist() for logprob in torch.sigmoid(logits)]
+                logprobs = F.logsigmoid(logits)
+            logprobs = [self._get_seq_cls_logprobs(pred, logprobs[i], top_logprobs) for i, pred in enumerate(preds)]
         return preds, logprobs
 
-    def decode(self, generate_ids: List[int], is_finished: bool = True, tokenizer_kwargs=None, **kwargs) -> Any:
+    def decode(self,
+               generate_ids: List[int],
+               *,
+               is_finished: bool = True,
+               tokenizer_kwargs=None,
+               first_token=True,
+               **kwargs) -> Any:
         tokenizer_kwargs = tokenizer_kwargs or {}
-        return self._skip_stop_decode(generate_ids, is_finished, **tokenizer_kwargs)
+        response = self._skip_stop_decode(generate_ids, is_finished, **tokenizer_kwargs)
+        if first_token and self.template_meta.response_prefix:
+            response = self.template_meta.response_prefix + response
+        return response
 
     def decode_prm(self, input_ids: torch.Tensor, logits: torch.Tensor) -> Any:
         raise NotImplementedError
 
     def generate(self, model, *args, **kwargs):
+        if 'use_model_defaults' in inspect.signature(model.generate).parameters and 'use_model_defaults' not in kwargs:
+            kwargs['use_model_defaults'] = False
         return model.generate(*args, **kwargs)
 
     def _skip_stop_decode(self, generate_ids: List[int], is_finished: bool, **decode_kwargs) -> Any:
@@ -554,6 +693,25 @@ class Template(ProcessorMixin):
         """
         return [f'[{self._get_bbox_str(bbox)}]']
 
+    def _pre_tokenize_images(self, context_list: List[Context], loss_scale_list: List[float],
+                             inputs: StdTemplateInputs) -> Tuple[List[Context], List[float]]:
+        # https://github.com/modelscope/ms-swift/issues/3407
+        # Fix the bounding box position offset issue in the Qwen2.5-VL grounding task.
+        res: List[Context] = []
+        res_loss_scale: List[float] = []
+        inputs.image_idx = 0
+
+        for context, loss_scale in zip(context_list, loss_scale_list):
+            if context == '<image>' and inputs.is_multimodal and inputs.image_idx < len(inputs.images):
+                c_list = self.replace_tag('image', inputs.image_idx, inputs)
+                inputs.image_idx += 1
+                loss_scale = 0.
+            else:
+                c_list = [context]
+            res += c_list
+            res_loss_scale += [loss_scale] * len(c_list)
+        return res, res_loss_scale
+
     def _pre_tokenize(self, context_list: List[Context], loss_scale_list: List[float],
                       inputs: StdTemplateInputs) -> Tuple[List[Context], List[float]]:
         """This method happens before tokenization, replace standard tags to the contents or input_ids needed by
@@ -565,6 +723,7 @@ class Template(ProcessorMixin):
         Returns:
             The context_list and loss_scale_list after replacement.
         """
+        context_list, loss_scale_list = self._pre_tokenize_images(context_list, loss_scale_list, inputs)
         if inputs.images and inputs.objects:
             self.normalize_bbox(inputs)
         # replace tag/object/box
@@ -572,11 +731,11 @@ class Template(ProcessorMixin):
         res_loss_scale: List[float] = []  # result of loss_scale_list
 
         # reset
-        for k in ['image', 'video', 'audio', 'object', 'box']:
+        for k in ['video', 'audio', 'object', 'box']:
             setattr(inputs, f'{k}_idx', 0)
 
         for context, loss_scale in zip(context_list, loss_scale_list):
-            for k in ['image', 'video', 'audio']:
+            for k in ['video', 'audio']:
                 if context == f'<{k}>' and inputs.is_multimodal and getattr(inputs, f'{k}_idx') < len(
                         getattr(inputs, f'{k}s')):
                     c_list = self.replace_tag(k, getattr(inputs, f'{k}_idx'), inputs)
@@ -605,6 +764,11 @@ class Template(ProcessorMixin):
     @staticmethod
     def _add_default_tags(inputs: StdTemplateInputs):
         total_content = '\n'.join([message['content'] or '' for message in inputs.messages])
+        if inputs.rejected_response:
+            if isinstance(inputs.rejected_response, str):
+                total_content += inputs.rejected_response
+            else:
+                total_content += '\n'.join(inputs.rejected_response)
         if inputs.system:
             total_content = f'{inputs.system}\n{total_content}'
         for media_type in ['image', 'audio', 'video']:
@@ -732,6 +896,9 @@ class Template(ProcessorMixin):
                 if self.is_training and not sep_token:
                     extra_context_list = template_meta.suffix
                     extra_context_type = ContextType.SUFFIX
+            elif template_meta.response_prefix:
+                # final round and during inference.
+                context_list.append(template_meta.response_prefix)
 
             self._concat_context_list(
                 context_list,
@@ -829,6 +996,17 @@ class Template(ProcessorMixin):
             val = inputs['generate_ids']
         for v in val:
             self.print_inputs({k: v.tolist()})
+
+    @staticmethod
+    def _split_list(inputs: List[int], x: int) -> List[List[int]]:
+        idxs = findall(inputs, x)
+        idxs.append(len(inputs))
+        res = []
+        lo = 0
+        for idx in idxs:
+            res.append(inputs[lo:idx])
+            lo = idx + 1
+        return res
 
     def replace_video2image(self, load_video_func, inputs, replace_tag: Callable) -> List[Context]:
         context_list = []
@@ -956,6 +1134,14 @@ class Template(ProcessorMixin):
                 res += b.pop(attr_name)
         return res
 
+    @staticmethod
+    def concat_tensor(batch: List[Dict[str, Any]], attr_name: str, dim: int) -> Optional[torch.Tensor]:
+        res = []
+        for b in batch:
+            if b.get(attr_name) is not None:
+                res.append(b.pop(attr_name))
+        return torch.concat(res, dim=dim) if res else None
+
     def _rlhf_data_collator(self,
                             batch: List[Dict[str, Any]],
                             *,
@@ -988,8 +1174,19 @@ class Template(ProcessorMixin):
                                  batch: List[Dict[str, Any]],
                                  *,
                                  padding_to: Optional[int] = None) -> Dict[str, Any]:
-        labels = [b.pop('labels') for b in batch if b.get('labels') is not None]
-        res = self._rlhf_data_collator(batch, padding_to=padding_to)
+        labels = []
+        new_batch = []
+        for b in batch:
+            keys = [key for key in b.keys() if 'negative' in key]
+            max_neg = max([int(re.findall(r'negative(-?\d+)', key)[0]) for key in keys]) if keys else None
+            indexes = ['anchor_', 'positive_']
+            if max_neg is not None:
+                for i in range(0, max_neg + 1):
+                    indexes.append(f'negative{i}_')
+            for prefix in indexes:
+                new_batch += self._fetch_inputs_startswith([b], prefix)
+            labels.extend(b.get('labels', None))
+        res = self._data_collator(new_batch, padding_to=padding_to)
         if labels:
             res['labels'] = torch.tensor(labels, dtype=torch.float32)
         return res
@@ -1015,26 +1212,31 @@ class Template(ProcessorMixin):
             padding_to(`int`, optional): Whether padding the batch to a fixed length, if none, the batch
                 will be padded to the `longest`
         """
-        from swift.utils import use_torchacc
         assert self.tokenizer.pad_token_id is not None
         padding_side = self.padding_side if self.is_training else 'left'
         padding_right = padding_side == 'right'
+        packing_mode = self.use_megatron or self._packing and 'position_ids' in batch[0]
         res = {}
-        inputs_embeds = [b['inputs_embeds'] for b in batch if b.get('inputs_embeds') is not None]
-        input_ids = [b['input_ids'] for b in batch if b.get('input_ids') is not None]
-        if inputs_embeds:
-            res['inputs_embeds'] = inputs_embeds
-        if input_ids:
-            res['input_ids'] = input_ids
-        for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids']:
-            val = [b[key] for b in batch if b.get(key) is not None]
-            if val:
-                res[key] = val
+        if packing_mode:
+            # only support llm
+            for k in ['input_ids', 'labels', 'position_ids']:
+                res[k] = [self.gather_list(batch, k)]
+        else:
+            inputs_embeds = [b['inputs_embeds'] for b in batch if b.get('inputs_embeds') is not None]
+            input_ids = [b['input_ids'] for b in batch if b.get('input_ids') is not None]
+            if inputs_embeds:
+                res['inputs_embeds'] = inputs_embeds
+            if input_ids:
+                res['input_ids'] = input_ids
+            for key in ['labels', 'loss_scale', 'position_ids', 'token_type_ids']:
+                val = [b[key] for b in batch if b.get(key) is not None]
+                if val:
+                    res[key] = val
 
         keys = [
             'input_ids', 'inputs_embeds', 'attention_mask', 'labels', 'loss_scale', 'position_ids', 'token_type_ids'
         ]
-        pad_value = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 1, 0]
+        pad_value = [self.tokenizer.pad_token_id, 0., 0, -100, 0., 0., 0]
         # Convert to tensor and remove unnecessary dimensions.
         seq_lens = None
         for key in keys:
@@ -1048,10 +1250,13 @@ class Template(ProcessorMixin):
                 res[key][i] = val
             if not seq_lens:
                 seq_lens = [seq.shape[0] for seq in res[key]]
-        if seq_lens and ('input_ids' in res or 'inputs_embeds' in res):
+        if not packing_mode and seq_lens and ('input_ids' in res or 'inputs_embeds' in res):
             res['attention_mask'] = [torch.ones(seq_len, dtype=torch.int64) for seq_len in seq_lens]
             if self.is_training and self.padding_side == 'left':
                 res['position_ids'] = [torch.arange(seq_len, dtype=torch.int64) for seq_len in seq_lens]
+
+        if self.use_megatron:
+            padding_to = math.ceil(max(seq_lens) / 128) * 128
 
         for key, pad_value in zip(keys, pad_value):
             if key not in res:
@@ -1064,6 +1269,15 @@ class Template(ProcessorMixin):
             res[key] = self._pad_sequence(res[key], pad_value)
 
         # multimodal
+        res.update(self._data_collator_mm_data(batch))
+        if use_torchacc() or self.sequence_parallel_size > 1:
+            res = self._torchacc_xtuner_data_collator(res, padding_to, self.tokenizer, padding_side)
+
+        return res
+
+    def _data_collator_mm_data(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # multimodal
+        res = {}
         pixel_values = [b['pixel_values'] for b in batch if b.get('pixel_values') is not None]
         if len(pixel_values) > 0:
             res['pixel_values'] = torch.concat(pixel_values)
@@ -1075,8 +1289,6 @@ class Template(ProcessorMixin):
         pixel_values_videos = [b['pixel_values_videos'] for b in batch if b.get('pixel_values_videos') is not None]
         if len(pixel_values_videos) > 0:
             res['pixel_values_videos'] = torch.concat(pixel_values_videos)
-        if use_torchacc() or self.sequence_parallel_size > 1:
-            res = self._torchacc_xtuner_data_collator(res, padding_to, self.tokenizer, padding_side)
         return res
 
     def _torchacc_xtuner_data_collator(self, res, padding_to, tokenizer, padding_side):
@@ -1129,6 +1341,8 @@ class Template(ProcessorMixin):
             if val is not None:
                 key_upper = key.upper()
                 logger.info(f'[{key_upper}_IDS] {val}')
+                if key == 'labels' and self.mode in {'seq_cls', 'embedding'}:
+                    continue
                 if isinstance(val, (list, tuple, torch.Tensor)):
                     val_str = self.safe_decode(val, **tokenizer_kwargs)
                     logger.info(f'[{key_upper}] {val_str}')
@@ -1205,7 +1419,7 @@ class Template(ProcessorMixin):
     def safe_decode(self, input_ids: List[int], **tokenizer_kwargs) -> str:
         if isinstance(self, Template):
             tokenizer = self.tokenizer
-            placeholder_tokens = self.template_meta.placeholder_tokens
+            placeholder_tokens = self.placeholder_tokens
         else:
             tokenizer = self
             placeholder_tokens = []
@@ -1238,3 +1452,27 @@ class Template(ProcessorMixin):
         else:
             result_str += tokenizer.decode(input_ids[e:], **tokenizer_kwargs)
         return result_str
+
+    @staticmethod
+    @contextmanager
+    def _patch_flash_attention_forward(modeling_module, position_ids, use_new_func: bool = False):
+        _origin_flash_attention_forward = modeling_module._flash_attention_forward
+
+        def _flash_attention_forward(*args, **kwargs):
+            if use_new_func:
+                from transformers.modeling_flash_attention_utils import (_flash_attention_forward as
+                                                                         flash_attention_forward)
+                if args and isinstance(args[0], nn.Module):
+                    args = args[1:]
+                if 'is_causal' not in kwargs:
+                    kwargs['is_causal'] = True
+            else:
+                flash_attention_forward = _origin_flash_attention_forward
+            kwargs['position_ids'] = position_ids
+            return flash_attention_forward(*args, **kwargs)
+
+        modeling_module._flash_attention_forward = _flash_attention_forward
+        try:
+            yield
+        finally:
+            modeling_module._flash_attention_forward = _origin_flash_attention_forward

@@ -1,23 +1,21 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import os
-import sys
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import json
-import torch
-from transformers.utils import is_torch_npu_available
 
 from swift.hub import get_hub
 from swift.llm import Processor, Template, get_model_tokenizer, get_template, load_by_unsloth, safe_snapshot_download
+from swift.llm.utils import get_ckpt_dir
 from swift.plugin import extra_tuners
-from swift.utils import check_json_format, get_dist_setting, get_logger, is_dist, is_master, use_hf_hub
+from swift.utils import (check_json_format, get_dist_setting, get_logger, import_external_file, is_dist, is_master,
+                         set_device, use_hf_hub)
 from .data_args import DataArguments
 from .generation_args import GenerationArguments
 from .model_args import ModelArguments
 from .quant_args import QuantizeArguments
 from .template_args import TemplateArguments
-from .utils import to_abspath
 
 logger = get_logger()
 
@@ -45,21 +43,16 @@ class CompatArguments:
         else:
             self.model = self.ckpt_dir
         self.ckpt_dir = None
-        logger.warning('The `--ckpt_dir` parameter will be removed in `ms-swift>=3.2`. '
+        logger.warning('The `--ckpt_dir` parameter will be removed in `ms-swift>=3.4`. '
                        'Please use `--model`, `--adapters`.')
 
     def __post_init__(self: 'BaseArguments'):
         if self.ckpt_dir is not None:
             self._handle_ckpt_dir()
 
-        if self.load_dataset_config is not None:
-            self.load_data_args = self.load_dataset_config
-            logger.warning('The `--load_dataset_config` parameter will be removed in `ms-swift>=3.1`. '
-                           'Please use `--load_data_args`.')
-
         if len(self.lora_modules) > 0:
             self.adapters += self.lora_modules
-            logger.warning('The `--lora_modules` parameter will be removed in `ms-swift>=3.1`. '
+            logger.warning('The `--lora_modules` parameter will be removed in `ms-swift>=3.4`. '
                            'Please use `--adapters`.')
 
 
@@ -85,6 +78,7 @@ class BaseArguments(CompatArguments, GenerationArguments, QuantizeArguments, Dat
     tuner_backend: Literal['peft', 'unsloth'] = 'peft'
     train_type: str = field(default='lora', metadata={'help': f'train_type choices: {list(get_supported_tuners())}'})
     adapters: List[str] = field(default_factory=list)
+    external_plugins: List[str] = field(default_factory=list)
 
     seed: int = 42
     model_kwargs: Optional[Union[dict, str]] = None
@@ -108,13 +102,20 @@ class BaseArguments(CompatArguments, GenerationArguments, QuantizeArguments, Dat
         """Register custom .py file to datasets"""
         if isinstance(self.custom_register_path, str):
             self.custom_register_path = [self.custom_register_path]
-        self.custom_register_path = to_abspath(self.custom_register_path, True)
+        if not self.custom_register_path:
+            return
         for path in self.custom_register_path:
-            folder, fname = os.path.split(path)
-            sys.path.append(folder)
-            __import__(fname.rstrip('.py'))
-        if self.custom_register_path:
-            logger.info(f'Successfully registered `{self.custom_register_path}`')
+            import_external_file(path)
+        logger.info(f'Successfully registered {self.custom_register_path}.')
+
+    def _import_external_plugins(self):
+        if isinstance(self.external_plugins, str):
+            self.external_plugins = [self.external_plugins]
+        if not self.external_plugins:
+            return
+        for external_plugin in self.external_plugins:
+            import_external_file(external_plugin)
+        logger.info(f'Successfully imported external_plugins: {self.external_plugins}.')
 
     @staticmethod
     def _check_is_adapter(adapter_dir: str) -> bool:
@@ -130,9 +131,6 @@ class BaseArguments(CompatArguments, GenerationArguments, QuantizeArguments, Dat
         self.adapters = [
             safe_snapshot_download(adapter, use_hf=self.use_hf, hub_token=self.hub_token) for adapter in self.adapters
         ]
-        for adapter in self.adapters:
-            assert self._check_is_adapter(adapter), (
-                f'`{adapter}` is not an adapter, please try using `--model` to pass it.')
 
     def __post_init__(self):
         if self.use_hf or use_hf_hub():
@@ -142,11 +140,16 @@ class BaseArguments(CompatArguments, GenerationArguments, QuantizeArguments, Dat
         self._init_adapters()
         self._init_ckpt_dir()
         self._init_custom_register()
+        self._import_external_plugins()
         self._init_model_kwargs()
         # The Seq2SeqTrainingArguments has a property called world_size, which cannot be assigned a value.
         self.rank, self.local_rank, self.global_world_size, self.local_world_size = get_dist_setting()
         logger.info(f'rank: {self.rank}, local_rank: {self.local_rank}, '
                     f'world_size: {self.global_world_size}, local_world_size: {self.local_world_size}')
+        if self.train_type not in extra_tuners:
+            for adapter in self.adapters:
+                assert self._check_is_adapter(adapter), (
+                    f'`{adapter}` is not an adapter, please try using `--model` to pass it.')
         ModelArguments.__post_init__(self)
         QuantizeArguments.__post_init__(self)
         TemplateArguments.__post_init__(self)
@@ -188,15 +191,9 @@ class BaseArguments(CompatArguments, GenerationArguments, QuantizeArguments, Dat
         return self
 
     def _init_ckpt_dir(self, adapters=None):
-        model_dirs = (adapters or self.adapters).copy()
-        if self.model:
-            model_dirs.append(self.model)
-        self.ckpt_dir = None
-        for model_dir in model_dirs:
-            if os.path.exists(os.path.join(model_dir, 'args.json')):
-                self.ckpt_dir = model_dir
-                break
-
+        # compat megatron
+        model = self.model or getattr(self, 'mcore_model', None) or getattr(self, 'load', None)
+        self.ckpt_dir = get_ckpt_dir(model, adapters or self.adapters)
         if self.ckpt_dir and self.load_args:
             self.load_args_from_ckpt()
 
@@ -238,20 +235,18 @@ class BaseArguments(CompatArguments, GenerationArguments, QuantizeArguments, Dat
                 setattr(self, key, old_value)
         logger.info(f'Successfully loaded {args_path}.')
 
-    def save_args(self) -> None:
+    def save_args(self, output_dir=None) -> None:
         if is_master():
-            os.makedirs(self.output_dir, exist_ok=True)
-            fpath = os.path.join(self.output_dir, 'args.json')
+            output_dir = output_dir or self.output_dir
+            os.makedirs(output_dir, exist_ok=True)
+            fpath = os.path.join(output_dir, 'args.json')
             logger.info(f'The {self.__class__.__name__} will be saved in: {fpath}')
             with open(fpath, 'w', encoding='utf-8') as f:
                 json.dump(check_json_format(self.__dict__), f, ensure_ascii=False, indent=2)
 
     def _init_device(self):
         if is_dist():
-            if is_torch_npu_available():
-                torch.npu.set_device(self.local_rank)
-            else:
-                torch.cuda.set_device(self.local_rank)
+            set_device()
 
     def get_template(self, processor: 'Processor') -> 'Template':
         template_kwargs = self.get_template_kwargs()

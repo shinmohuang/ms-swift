@@ -1,10 +1,12 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import inspect
 import os
 from typing import List, Union
 
 import torch
 import transformers
 from packaging import version
+from transformers import TrainingArguments
 
 from swift.llm import TrainArguments, get_model_arch
 from swift.plugin import Tuner, extra_tuners
@@ -74,11 +76,11 @@ def get_multimodal_target_regex(
     ignore_pattern += model_arch.lm_head or []
     ignore_pattern = '|'.join(ignore_pattern)
 
-    target_regex = f'^({prefix_pattern})'
+    target_regex = rf'^({prefix_pattern})'
     if ignore_pattern:
-        target_regex += f'(?!.*({ignore_pattern})).*'
+        target_regex += rf'(?!.*\b({ignore_pattern})\b).*'
     if rejected_pattern:
-        target_regex = f'(?!^({rejected_pattern}))' + target_regex
+        target_regex = rf'(?!^({rejected_pattern}))' + target_regex
     return target_regex
 
 
@@ -201,7 +203,7 @@ def prepare_adapter(args: TrainArguments, model, *, template=None, train_dataset
                 lora_kwargs.pop('lorap_lr_ratio')
                 model = UnslothModel.get_peft_model(
                     model,
-                    use_gradient_checkpointing=True,
+                    use_gradient_checkpointing='unsloth',
                     max_seq_length=args.max_length or 2048,  # 2048 is the default value of unsloth
                     **lora_kwargs,
                 )
@@ -215,6 +217,7 @@ def prepare_adapter(args: TrainArguments, model, *, template=None, train_dataset
     elif args.train_type == 'adalora':
         lora_kwargs.pop('lorap_lr_ratio', None)
         lora_kwargs['rank_pattern'] = None
+        from swift.plugin.optimizer import calculate_max_steps
         adalora_config = AdaLoraConfig(
             task_type=task_type,
             **lora_kwargs,
@@ -226,6 +229,7 @@ def prepare_adapter(args: TrainArguments, model, *, template=None, train_dataset
             beta1=args.adalora_beta1,
             beta2=args.adalora_beta2,
             orth_reg_weight=args.adalora_orth_reg_weight,
+            total_step=calculate_max_steps(args.training_args, train_dataset),
         )
         model = Swift.prepare_model(model, adalora_config)
         logger.info(f'adalora_config: {adalora_config}')
@@ -335,12 +339,12 @@ class TunerMixin:
 
     @classmethod
     def prepare_model(cls, args, model, *, template=None, train_dataset=None, task_type=None):
-        if args.use_liger:
+        if args.use_liger_kernel and 'use_liger_kernel' not in inspect.signature(TrainingArguments).parameters:
             # Apply liger
             apply_liger(args.model_type)
 
         if args.is_adapter:
-            if args.tuner_backend != 'unsloth':
+            if args.tuner_backend != 'unsloth' and args.train_type not in extra_tuners:
                 # Fix the name of the layer in xcomposer that contains Plora.
                 # Unsloth prepares and loads lora outside this function when
                 # resume_from_checkpoint, so do not disable grad here

@@ -24,14 +24,14 @@ if TYPE_CHECKING:
                         git_clone_github, get_matched_model_meta)
     from .dataset import (AlpacaPreprocessor, ResponsePreprocessor, MessagesPreprocessor, AutoPreprocessor,
                           DATASET_MAPPING, MediaResource, register_dataset, register_dataset_info, EncodePreprocessor,
-                          LazyLLMDataset, ConstantLengthDataset, load_dataset, DATASET_TYPE, sample_dataset,
-                          RowPreprocessor, DatasetMeta, HfDataset, SubsetDataset)
+                          LazyLLMDataset, load_dataset, DATASET_TYPE, sample_dataset, RowPreprocessor, DatasetMeta,
+                          HfDataset, SubsetDataset)
     from .utils import (deep_getattr, to_float_dtype, to_device, History, Messages, history_to_messages,
                         messages_to_history, Processor, save_checkpoint, ProcessorMixin,
-                        get_temporary_cache_files_directory, get_cache_dir)
+                        get_temporary_cache_files_directory, get_cache_dir, is_moe_model)
     from .base import SwiftPipeline
+    from .data_loader import DataLoaderDispatcher, DataLoaderShard, BatchSamplerShard
 else:
-    _extra_objects = {k: v for k, v in globals().items() if not k.startswith('_')}
     _import_structure = {
         'rlhf': ['rlhf_main'],
         'infer': [
@@ -60,17 +60,18 @@ else:
             'load_by_unsloth', 'git_clone_github', 'get_matched_model_meta'
         ],
         'dataset': [
-            'AlpacaPreprocessor', 'MessagesPreprocessor', 'DATASET_MAPPING', 'MediaResource', 'register_dataset',
-            'register_dataset_info', 'EncodePreprocessor', 'LazyLLMDataset', 'ConstantLengthDataset', 'load_dataset',
+            'AlpacaPreprocessor', 'MessagesPreprocessor', 'AutoPreprocessor', 'DATASET_MAPPING', 'MediaResource',
+            'register_dataset', 'register_dataset_info', 'EncodePreprocessor', 'LazyLLMDataset', 'load_dataset',
             'DATASET_TYPE', 'sample_dataset', 'RowPreprocessor', 'ResponsePreprocessor', 'DatasetMeta', 'HfDataset',
             'SubsetDataset'
         ],
         'utils': [
             'deep_getattr', 'to_device', 'to_float_dtype', 'History', 'Messages', 'history_to_messages',
             'messages_to_history', 'Processor', 'save_checkpoint', 'ProcessorMixin',
-            'get_temporary_cache_files_directory', 'get_cache_dir'
+            'get_temporary_cache_files_directory', 'get_cache_dir', 'is_moe_model'
         ],
         'base': ['SwiftPipeline'],
+        'data_loader': ['DataLoaderDispatcher', 'DataLoaderShard', 'BatchSamplerShard'],
     }
 
     import sys
@@ -80,5 +81,5 @@ else:
         globals()['__file__'],
         _import_structure,
         module_spec=__spec__,
-        extra_objects=_extra_objects,
+        extra_objects={},
     )

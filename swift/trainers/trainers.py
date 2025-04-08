@@ -5,21 +5,22 @@ from contextlib import contextmanager, nullcontext
 from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
+import torch.distributed as dist
 from peft import PeftModel
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader
 from transformers import EvalPrediction
 from transformers import Seq2SeqTrainer as HfSeq2SeqTrainer
 from transformers import Trainer as HfTrainer
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.utils import is_peft_available
 
-from swift.utils import JsonlWriter, Serializer
+from swift.llm import BatchSamplerShard, DataLoaderDispatcher, DataLoaderShard
+from swift.utils import JsonlWriter, Serializer, gc_collect
 from .arguments import Seq2SeqTrainingArguments, TrainingArguments
 from .mixin import SwiftMixin
-from .torchacc_mixin import TorchAccMixin
 
 
 class Trainer(SwiftMixin, HfTrainer):
@@ -58,7 +59,7 @@ class Trainer(SwiftMixin, HfTrainer):
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
         if inputs.get('labels') is not None:
             self._compute_acc(outputs, inputs['labels'])
-        if num_items_in_batch is not None:
+        if num_items_in_batch is not None and self.model_accepts_loss_kwargs:
             loss /= self.args.gradient_accumulation_steps
         return (loss, outputs) if return_outputs else loss
 
@@ -72,51 +73,14 @@ class EmbeddingTrainer(Trainer):
         self.label_names = ['labels']
 
     def calculate_metric(self, eval_prediction: EvalPrediction) -> Dict[str, float]:
-        from sklearn.metrics.pairwise import paired_cosine_distances, paired_euclidean_distances, \
-            paired_manhattan_distances
-        from scipy.stats import pearsonr, spearmanr
-
-        embeddings = eval_prediction.predictions
-        labels = eval_prediction.label_ids
-        batch_size = 2 * self.args.per_device_eval_batch_size
-        half_batch_size = self.args.per_device_eval_batch_size
-        embeddings1 = []
-        embeddings2 = []
-        for i in range(embeddings.shape[0] // batch_size):
-            embeddings1.append(embeddings[i * batch_size:i * batch_size + half_batch_size])
-            embeddings2.append(embeddings[i * batch_size + half_batch_size:(i + 1) * batch_size])
-
-        embeddings1 = np.concatenate(embeddings1)
-        embeddings2 = np.concatenate(embeddings2)
-        if len(embeddings1.shape) == 3:
-            embeddings1 = embeddings1[:, 0]
-            embeddings2 = embeddings2[:, 0]
-        cosine_scores = 1 - (paired_cosine_distances(embeddings1, embeddings2))
-        manhattan_distances = -paired_manhattan_distances(embeddings1, embeddings2)
-        euclidean_distances = -paired_euclidean_distances(embeddings1, embeddings2)
-        dot_products = [np.dot(emb1, emb2) for emb1, emb2 in zip(embeddings1, embeddings2)]
-
-        eval_pearson_cosine, _ = pearsonr(labels, cosine_scores)
-        eval_spearman_cosine, _ = spearmanr(labels, cosine_scores)
-
-        eval_pearson_manhattan, _ = pearsonr(labels, manhattan_distances)
-        eval_spearman_manhattan, _ = spearmanr(labels, manhattan_distances)
-
-        eval_pearson_euclidean, _ = pearsonr(labels, euclidean_distances)
-        eval_spearman_euclidean, _ = spearmanr(labels, euclidean_distances)
-
-        eval_pearson_dot, _ = pearsonr(labels, dot_products)
-        eval_spearman_dot, _ = spearmanr(labels, dot_products)
-
-        return {
-            'cosine': eval_spearman_cosine,
-            'euclidean': eval_pearson_euclidean,
-            'manhattan': eval_pearson_manhattan,
-            'dot_product': eval_spearman_dot,
-        }
+        from swift.plugin.loss import infonce_loss, calculate_paired_metrics, calculate_infonce_metrics
+        if self.compute_loss_func is infonce_loss:
+            return calculate_infonce_metrics(eval_prediction.predictions, eval_prediction.label_ids)
+        else:
+            return calculate_paired_metrics(eval_prediction.predictions, eval_prediction.label_ids)
 
 
-class Seq2SeqTrainer(TorchAccMixin, SwiftMixin, HfSeq2SeqTrainer):
+class Seq2SeqTrainer(SwiftMixin, HfSeq2SeqTrainer):
     args: Seq2SeqTrainingArguments
 
     def __init__(self, *args, **kwargs):
@@ -150,10 +114,49 @@ class Seq2SeqTrainer(TorchAccMixin, SwiftMixin, HfSeq2SeqTrainer):
             self.data_collator = origin_data_collator
             self.template.set_mode(origin_mode)
 
+    def get_train_dataloader(self):
+        if self.template.sequence_parallel_size == 1:
+            # Higher efficiency
+            if self.train_dataset is None:
+                raise ValueError('Trainer: training requires a train_dataset.')
+            args = self.args
+            train_dataset = self.train_dataset
+
+            dataloader_params = {
+                'collate_fn': self.data_collator,
+                'num_workers': args.dataloader_num_workers,
+                'pin_memory': args.dataloader_pin_memory,
+                'persistent_workers': args.dataloader_persistent_workers,
+                'prefetch_factor': args.dataloader_prefetch_factor
+            }
+            batch_sampler_params = {
+                'drop_last': args.dataloader_drop_last,
+                'shuffle': args.train_dataloader_shuffle,
+                'data_seed': args.data_seed,
+            }
+
+            if hasattr(train_dataset, '__len__'):
+                batch_sampler = BatchSamplerShard(
+                    len(train_dataset), batch_size=self._train_batch_size, **batch_sampler_params)
+                dataloader = DataLoaderShard(train_dataset, batch_sampler, **dataloader_params)
+            else:
+                # IterableDataset
+                if dist.is_initialized():
+                    dataloader_params['prefetch_factor'] = dataloader_params['prefetch_factor'] * dist.get_world_size()
+                dataloader = DataLoader(train_dataset, batch_size=self._train_batch_size, **dataloader_params)
+                dataloader = DataLoaderDispatcher(dataloader)
+
+            return dataloader
+        else:
+            from swift.trainers.xtuner import get_xtuner_train_dataloader
+            return get_xtuner_train_dataloader(self)
+
     def evaluate(self, *args, **kwargs):
         context = self._patch_predict_with_generate() if self.args.predict_with_generate else nullcontext()
         with context:
-            return super().evaluate(*args, **kwargs)
+            res = super().evaluate(*args, **kwargs)
+            gc_collect()
+            return res
 
     def prediction_step(
         self,
@@ -198,7 +201,8 @@ class Seq2SeqTrainer(TorchAccMixin, SwiftMixin, HfSeq2SeqTrainer):
         if loss_scale is not None:
             loss_kwargs['loss_scale'] = loss_scale
 
-        outputs = model(**inputs)
+        with self.template.compute_loss_context(model, inputs):
+            outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
@@ -206,6 +210,7 @@ class Seq2SeqTrainer(TorchAccMixin, SwiftMixin, HfSeq2SeqTrainer):
 
         if labels is None:
             labels = inputs['labels']
+            outputs.loss = outputs.loss.to(labels.device)
             # fix https://github.com/huggingface/transformers/issues/34263
             if num_items_in_batch is not None:
                 outputs.loss = outputs.loss * (labels[:, 1:] != -100).sum() / num_items_in_batch
@@ -230,11 +235,11 @@ class Seq2SeqTrainer(TorchAccMixin, SwiftMixin, HfSeq2SeqTrainer):
             else:
                 loss = self.label_smoother(outputs, labels)
 
-        if self.args.sequence_parallel_size > 1:
+        if self.template.sequence_parallel_size > 1:
             from swift.trainers.xtuner import reduce_xtuner_sequence_parallel_loss
             loss = reduce_xtuner_sequence_parallel_loss(loss, labels)
 
-        if getattr(self.args, 'average_tokens_across_devices', False):
+        if getattr(self.args, 'average_tokens_across_devices', False) and self.model_accepts_loss_kwargs:
             loss *= self.accelerator.num_processes
 
         if outputs.logits is not None and labels is not None:

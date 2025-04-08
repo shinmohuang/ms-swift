@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from swift.llm import MODEL_MAPPING
 from swift.trainers.arguments import GRPOArgumentsMixin
-from swift.utils import get_logger
+from swift.utils import get_logger, set_default_ddp_config
 from .train_args import TrainArguments
 
 logger = get_logger()
@@ -55,7 +55,6 @@ class GRPOArguments(GRPOArgumentsMixin):
 
     # multi step
     num_iterations: int = 1
-    epsilon: float = 0.2
 
 
 @dataclass
@@ -109,6 +108,9 @@ class RLHFArguments(GRPOArguments, PPOArguments, RewardModelArguments, TrainArgu
         self._init_ppo()
         self._set_default()
         super().__post_init__()
+        self._init_grpo_ds3()
+        self._check_rlhf()
+        self._check_grpo()
 
         if self.loss_scale is None:
             if self.rlhf_type == 'orpo' and not self.model_meta.is_multimodal:
@@ -126,29 +128,31 @@ class RLHFArguments(GRPOArguments, PPOArguments, RewardModelArguments, TrainArgu
         elif self.ref_model is not None:
             raise ValueError('CPO/ORPO or LoRA training does not require a ref_model to be passed in.')
 
-    @staticmethod
-    def _set_default_ddp_config():
-        # It runs normally with Python as well.
-        rank = int(os.getenv('RANK', -1))
-        if rank == -1:
-            os.environ['NPROC_PER_NODE'] = '1'
-            os.environ['RANK'] = '0'
-            os.environ['LOCAL_RANK'] = '0'
-            os.environ['WORLD_SIZE'] = '1'
-            os.environ['LOCAL_WORLD_SIZE'] = '1'
-            os.environ['MASTER_ADDR'] = '127.0.0.1'
-            os.environ['MASTER_PORT'] = '29500'
-
     def _init_grpo(self):
         if self.rlhf_type == 'grpo':
             if self.use_vllm or self.use_lmdeploy:
                 os.environ['USE_FAST_INFERENCE'] = '1'
-                self._set_default_ddp_config()
+                set_default_ddp_config()
+            if self.async_generate or not self.use_vllm:
+                self.sleep_level = 0
+            if self.sleep_level > 0:
+                self.gradient_accumulation_steps = 1
             self.remove_unused_columns = False
             logger.info(f'Setting args.remove_unused_columns: {self.remove_unused_columns}')
             self.truncation_strategy = 'left'  # Used for trimming the excessively long parts of a prompt.
             if self.beta is None:
                 self.beta = 0.04  # https://arxiv.org/abs/2402.03300
+            if self.async_generate:
+                logger.info('Using async mode. This is a approximate version which '
+                            'will use the old weights to generate responses to accelerate. '
+                            'This will ignore the `CLIP` of advantages, if you found the training '
+                            'is unstable, you may consider using --async_generate false.')
+            if 'soft_overlong' in self.reward_funcs:
+                assert self.soft_cache_length is not None, \
+                    'The soft_cache_length must be set when using soft overlong rewards.'
+                if self.soft_max_length is None:
+                    self.soft_max_length = self.max_completion_length
+                    logger.info(f'Auto-configured soft_max_length = max_completion_length {self.max_completion_length}')
 
     def _init_ppo(self):
         if self.rlhf_type == 'ppo':
@@ -184,3 +188,56 @@ class RLHFArguments(GRPOArguments, PPOArguments, RewardModelArguments, TrainArgu
                 self.loss_type = 'sigmoid'  # else None
             elif self.rlhf_type in ['kto']:
                 self.loss_type = 'kto'
+
+    def _init_grpo_ds3(self):
+        if self.rlhf_type == 'grpo' and self.deepspeed:
+            if 'zero_optimization' in self.deepspeed and self.deepspeed['zero_optimization']['stage'] == 3:
+                self.deepspeed['zero_optimization']['stage3_prefetch_bucket_size'] = 0
+
+    def _check_rlhf(self):
+        if self.sequence_parallel_size > 1:
+            raise ValueError('RLHF do not support sequence parallel')
+
+    def _check_grpo(self):
+        if self.rlhf_type != 'grpo':
+            return
+        from swift.utils import get_device_count, get_dist_setting
+        device_count = get_device_count()
+        _, _, _, local_world_size = get_dist_setting()
+        num_infer_workers = self.num_infer_workers
+        fast_infer = self.use_vllm or self.use_lmdeploy
+        if fast_infer:
+            is_colocate_mode = (device_count == num_infer_workers)
+
+            if is_colocate_mode:
+                # colocate mode
+                assert device_count == local_world_size, (
+                    f'Colocate mode requires device_count({device_count}) == num_infer_workers({num_infer_workers}). '
+                    'Please check if your device count matches NPROC_PER_NODE setting.')
+                logger.info(
+                    'You are using colocate mode because you have set num_infer_workers to be the same as '
+                    'NPROC_PER_NODE, where model training and sampling will be performed on a single GPU. '
+                    'If you encounter an Out-of-Memory (OOM) error, it is recommended to set the `sleep_level`, '
+                    '`offload_model`, and `offload_optimizer` parameters.')
+                assert not self.async_generate, 'async_generate requires async mode, but you are under colocate mode'
+                if self.use_lmdeploy and self.tensor_parallel_size > 1:
+                    raise ValueError('Currently LMDeploy do not support tensor parallel')
+                if self.use_vllm and self.sleep_level:
+                    logger.warning('It is highly recommended to use `sleep_level==1` in colocate mode,'
+                                   'otherwise it may lead to an OOM (Out of Memory) error.')
+            else:
+                # async mode
+                assert device_count == (local_world_size + num_infer_workers), (
+                    f'Async mode requires total GPUs({device_count}) = training GPUs({local_world_size}) + '
+                    f'inference workers({num_infer_workers}). Please adjust your GPU allocation.')
+                logger.info(
+                    'You are using async mode, where model training and sampling will be performed on different GPUs.')
+                if self.sleep_level > 0:
+                    logger.warning('You are using different GPUs for training and rollout, '
+                                   'so you do not need to use sleep_level > 0')
+
+                assert self.tensor_parallel_size == 1, ('async mode do not support tensor parallel right now')
+
+        if self.mini_batch_size:
+            assert self.per_device_train_batch_size % self.mini_batch_size == 0,\
+                'per_device_train_batch_size needs be divisible by mini_batch_size'

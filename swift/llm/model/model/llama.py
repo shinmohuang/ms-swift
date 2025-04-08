@@ -177,7 +177,7 @@ register_model(
         TemplateType.llama3_2,
         get_model_tokenizer_with_flash_attn,
         architectures=['LlamaForCausalLM'],
-        requires=['transformers>=4.45'],
+        requires=['transformers>=4.43'],
         model_arch=ModelArch.llama,
     ))
 
@@ -203,6 +203,35 @@ register_model(
         get_model_tokenizer_llama3_2_vision,
         requires=['transformers>=4.45'],
         architectures=['MllamaForConditionalGeneration'],
+        model_arch=ModelArch.llama3_2_vision,
+        tags=['vision'],
+    ))
+
+
+def get_model_tokenizer_llama4(*args, **kwargs):
+    from transformers import Llama4ForConditionalGeneration
+    kwargs['automodel_class'] = kwargs['automodel_class'] or Llama4ForConditionalGeneration
+    return get_model_tokenizer_multimodal(*args, **kwargs)
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.llama4,
+        [
+            ModelGroup([
+                Model('LLM-Research/Llama-4-Scout-17B-16E', 'meta-llama/Llama-4-Scout-17B-16E'),
+                Model('LLM-Research/Llama-4-Maverick-17B-128E', 'meta-llama/Llama-4-Maverick-17B-128E'),
+                Model('LLM-Research/Llama-4-Scout-17B-16E-Instruct', 'meta-llama/Llama-4-Scout-17B-16E-Instruct'),
+                Model('LLM-Research/Llama-4-Maverick-17B-128E-Instruct-FP8',
+                      'meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8'),
+                Model('LLM-Research/Llama-4-Maverick-17B-128E-Instruct',
+                      'meta-llama/Llama-4-Maverick-17B-128E-Instruct'),
+            ])
+        ],
+        TemplateType.llama4,
+        get_model_tokenizer_llama4,
+        requires=['transformers>=4.51'],
+        architectures=['Llama4ForConditionalGeneration'],
         model_arch=ModelArch.llama3_2_vision,
         tags=['vision'],
     ))
@@ -250,7 +279,7 @@ register_model(
         get_model_tokenizer_omnli,
         architectures=['OmniSpeech2SLlamaForCausalLM'],
         model_arch=ModelArch.llama3_1_omni,
-        requires=['whisper', 'openai-whisper'],
+        requires=['openai-whisper'],
         tags=['audio'],
     ))
 

@@ -244,7 +244,7 @@ class MathAccuracy(ORM):
         from math_verify import LatexExtractionConfig, parse, verify
         rewards = []
         for content, sol in zip(completions, solution):
-            gold_parsed = parse(sol, extraction_mode='first_match', extraction_config=[LatexExtractionConfig()])
+            gold_parsed = parse(sol, extraction_mode='first_match')
             if len(gold_parsed) != 0:
                 # We require the answer to be provided in correct latex (no malformed operators)
                 answer_parsed = parse(
@@ -266,11 +266,14 @@ class MathAccuracy(ORM):
                     ],
                     extraction_mode='first_match',
                 )
-                # Reward 1 if the content is the same as the ground truth, 0 otherwise
-                reward = float(verify(answer_parsed, gold_parsed))
+                # edge case
+                try:
+                    reward = float(verify(gold_parsed, answer_parsed))
+                except Exception:
+                    reward = 0.0
             else:
-                # If the gold solution is not parseable, we reward 1 to skip this example
-                reward = 1.0
+                # If the gold solution is not parseable, we reward 0 to skip this example
+                reward = 0.0
             rewards.append(reward)
         return rewards
 
@@ -296,12 +299,14 @@ class ReActFormat(ORM):
 class CosineReward(ORM):
     # https://arxiv.org/abs/2502.03373
     def __init__(self,
-                 cosine_min_len_value_wrong: float = 0.0,
-                 cosine_max_len_value_wrong: float = -0.5,
+                 tokenizer=None,
+                 cosine_min_len_value_wrong: float = -0.5,
+                 cosine_max_len_value_wrong: float = 0.0,
                  cosine_min_len_value_correct: float = 1.0,
                  cosine_max_len_value_correct: float = 0.5,
                  cosine_max_len: int = 1000,
                  accuracy_orm=None):
+        self.tokenizer = tokenizer
         self.min_len_value_wrong = cosine_min_len_value_wrong
         self.max_len_value_wrong = cosine_max_len_value_wrong
         self.min_len_value_correct = cosine_min_len_value_correct
@@ -324,9 +329,9 @@ class CosineReward(ORM):
                 min_value = self.max_len_value_correct
                 max_value = self.min_len_value_correct
             else:
-                min_value = self.min_len_value_wrong
-                max_value = self.max_len_value_wrong
-            gen_len = len(content)
+                min_value = self.max_len_value_wrong
+                max_value = self.min_len_value_wrong
+            gen_len = len(self.tokenizer.encode(content))
             reward = self.cosfn(gen_len, self.max_len, min_value, max_value)
             rewards.append(reward)
         return rewards

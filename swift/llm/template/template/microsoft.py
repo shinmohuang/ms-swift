@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
 import json
+import torch
 from torch import nn
 
 from ..base import Template
@@ -10,6 +11,7 @@ from ..constant import LLMTemplateType, MLLMTemplateType
 from ..register import TemplateMeta, register_template
 from ..template_inputs import StdTemplateInputs
 from ..utils import Context, Prompt, findall
+from ..vision_utils import load_file
 
 
 class FlorenceTemplate(Template):
@@ -44,7 +46,7 @@ class FlorenceTemplate(Template):
             labels = [0] + labels
         if images:
             pixel_values = processor.image_processor(
-                images, return_tensors='pt')['pixel_values'].to(self.config.torch_dtype)
+                images, return_tensors='pt')['pixel_values'].to(self.model_info.torch_dtype)
             encoded['pixel_values'] = pixel_values
         encoded['input_ids'] = input_ids
         encoded['labels'] = labels
@@ -150,4 +152,54 @@ class Phi3VisionTemplate(Template):
         return encoded
 
 
+class Phi4MMTemplate(Template):
+    placeholder_tokens = ['<|endoftext10|>', '<|endoftext11|>']
+
+    def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
+                    inputs: StdTemplateInputs) -> List[Context]:
+        if media_type == 'image':
+            return [[-100]]
+        elif media_type == 'audio':
+            import soundfile as sf
+            inputs.audios[index] = sf.read(load_file(inputs.audios[index]))
+            return [[-200]]
+
+    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+        encoded = super()._encode(inputs)
+        input_ids = encoded['input_ids']
+        labels = encoded['labels']
+        images_idx = findall(input_ids, -100)
+        audios_idx = findall(input_ids, -200)
+        text = '\n'.join(['<|image_1|>'] * len(inputs.images) + ['<|audio_1|>'] * len(inputs.audios))
+        new_encoded = self.processor(
+            text=text, images=inputs.images or None, audios=inputs.audios or None, return_tensors='pt')
+        placeholders = self._split_list(new_encoded.pop('input_ids')[0].tolist(), 198)
+
+        def _get_new_tokens(i):
+            return placeholders[i]
+
+        encoded['input_ids'], encoded['labels'] = self._extend_tokens(input_ids, labels, images_idx + audios_idx,
+                                                                      _get_new_tokens)
+        new_encoded.pop('attention_mask')
+        encoded.update(new_encoded)
+        return encoded
+
+    def _data_collator(self, batch: List[Dict[str, Any]], *, padding_to: Optional[int] = None) -> Dict[str, Any]:
+        res = super()._data_collator(batch, padding_to=padding_to)
+        keys = [
+            'input_image_embeds', 'image_sizes', 'image_attention_mask', 'input_audio_embeds', 'audio_embed_sizes',
+            'input_mode'
+        ]
+        inputs = self.fetch_inputs(batch, keys)
+        for k, v in inputs.items():
+            inputs[k] = torch.concat(v)
+        res.update(inputs)
+        return res
+
+
 register_template(Phi3TemplateMeta(MLLMTemplateType.phi3_vision, template_cls=Phi3VisionTemplate))
+
+register_template(Phi3TemplateMeta(
+    MLLMTemplateType.phi4_multimodal,
+    template_cls=Phi4MMTemplate,
+))

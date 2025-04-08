@@ -4,6 +4,7 @@ import inspect
 import os
 import shutil
 import time
+from contextlib import contextmanager
 from copy import copy
 from types import MethodType
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -60,18 +61,20 @@ class SwiftMixin:
                  preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
                  **kwargs) -> None:
         if args.check_model and hasattr(model, 'model_dir'):
-            check_local_model_is_latest(
-                model.model_dir, user_agent={
-                    'invoked_by': 'local_trainer',
-                    'third_party': 'swift',
-                })
+            from swift.utils.logger import ms_logger_ignore_error
+            with ms_logger_ignore_error():
+                check_local_model_is_latest(
+                    model.model_dir, user_agent={
+                        'invoked_by': 'local_trainer',
+                        'third_party': 'swift',
+                    })
         self._custom_metrics = {}
         self.template = template
         self.max_memory = 0
         self.hub = get_hub()
-        if args.sequence_parallel_size > 1:
+        if template.sequence_parallel_size > 1:
             from swift.trainers.xtuner import init_sequence_parallel_xtuner
-            init_sequence_parallel_xtuner(args.sequence_parallel_size)
+            init_sequence_parallel_xtuner(template.sequence_parallel_size)
 
         self.model_meta = model.model_meta
         with self.hub.patch_hub():
@@ -91,8 +94,9 @@ class SwiftMixin:
 
         self.compute_loss_func = compute_loss_func
         if get_function(model.__class__.forward) is not get_function(model.forward):
-            self.label_names = find_labels(model) or ['labels']
+            self.label_names = find_labels(model)
             self.can_return_loss = can_return_loss(model)
+        self.label_names = self.label_names or ['labels']
         self.start_time = time.time()
 
     def _save_initial_model(self, output_dir):
@@ -220,7 +224,14 @@ class SwiftMixin:
         if not is_adapter:
             from swift.llm import save_checkpoint
             additional_saved_files = self.model_meta.additional_saved_files
-            save_checkpoint(None, self.template.processor, output_dir, additional_saved_files=additional_saved_files)
+            save_checkpoint(
+                None,
+                self.template.processor,
+                output_dir,
+                model_dirs=[self.model.model_dir],
+                additional_saved_files=additional_saved_files)
+            if getattr(self.model, 'origin_generation_config', None):
+                self.model.origin_generation_config.save_pretrained(output_dir)
 
     def _fix_zero3_gather_all_parameters(self) -> None:
         if is_deepspeed_zero3_enabled() and not hasattr(self.deepspeed, '_zero3_consolidated_16bit_state_dict_origin'):
@@ -248,6 +259,27 @@ class SwiftMixin:
         logger.info(f'Saving model checkpoint to {self.state.last_model_checkpoint}')
         return result
 
+    @staticmethod
+    @contextmanager
+    def _fix_grad_norm_nan():
+        from accelerate import Accelerator
+        origin_clip_grad_norm_ = Accelerator.clip_grad_norm_
+
+        def clip_grad_norm_(self, parameters, *args, **kwargs):
+            # If NaN occurs, ignore weight updates.
+            parameters = list(parameters)
+            grad_norm = origin_clip_grad_norm_(self, parameters, *args, **kwargs)
+            if isinstance(grad_norm, torch.Tensor) and grad_norm.isnan().item():
+                for p in parameters:
+                    p.grad = None
+            return grad_norm
+
+        Accelerator.clip_grad_norm_ = clip_grad_norm_
+        try:
+            yield
+        finally:
+            Accelerator.clip_grad_norm_ = origin_clip_grad_norm_
+
     def train(self, *args, **kwargs):
         if self.model_meta.is_multimodal:
             models = list(
@@ -256,9 +288,9 @@ class SwiftMixin:
                     if isinstance(v, nn.Module) and k in {'model', 'ref_model', 'reward_model', 'value_model'}
                 ]))
             self.template.register_post_encode_hook(models)
-            logger.info(f'Successfully registered post_encode hook: {[model.__class__.__name__ for model in models]}')
+            logger.info(f'Successfully registered post_encode hook: {[model.__class__.__name__ for model in models]}.')
         self._save_initial_model(self.args.output_dir)
-        with self.hub.patch_hub():
+        with self.hub.patch_hub(), self._fix_grad_norm_nan():
             res = super().train(*args, **kwargs)
         self.template.remove_post_encode_hook()
         return res
@@ -314,6 +346,9 @@ class SwiftMixin:
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
             self.log(logs)
+
+        if self.args.eval_use_evalscope and self.control.should_evaluate:
+            self._evalscope_eval()
         super()._maybe_log_save_evaluate(tr_loss, *args, **kwargs)
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
@@ -328,19 +363,6 @@ class SwiftMixin:
         else:
             super().create_optimizer_and_scheduler(num_training_steps=num_training_steps)
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        if self.args.train_sampler_random:
-            return super()._get_train_sampler()
-        else:
-            return self._get_eval_sampler(self.train_dataset)
-
-    def get_train_dataloader(self):
-        if self.args.sequence_parallel_size == 1:
-            return super().get_train_dataloader()
-        else:
-            from swift.trainers.xtuner import get_xtuner_train_dataloader
-            return get_xtuner_train_dataloader(self)
-
     def _compute_acc(self, outputs, labels) -> None:
         args = self.args
         acc_steps = args.acc_steps
@@ -351,8 +373,37 @@ class SwiftMixin:
                 preds = preds.to('cpu')
                 labels = labels.to('cpu')
             metrics = compute_acc(
-                preds, labels, acc_strategy=args.acc_strategy, is_encoder_decoder=args.is_encoder_decoder)
+                preds, labels, acc_strategy=args.acc_strategy, is_encoder_decoder=self.template.is_encoder_decoder)
             for k, v in metrics.items():
                 if k not in self._custom_metrics:
                     self._custom_metrics[k] = MeanMetric(nan_value=None)
                 self._custom_metrics[k].update(v)
+
+    @torch.no_grad()
+    def _evalscope_eval(self):
+        from ..llm.eval.utils import EvalModel
+        from evalscope import TaskConfig, run_task
+        from evalscope.constants import EvalType
+
+        self.model.eval()
+        max_batch_size = self.args.per_device_eval_batch_size
+        custom_model = EvalModel(
+            self.model, self.template, max_batch_size=max_batch_size, model_name=f'model-step{self.state.global_step}')
+        task_config = TaskConfig(
+            model=custom_model,
+            eval_type=EvalType.CUSTOM,
+            datasets=self.args.eval_datasets,
+            dataset_args=self.args.eval_datasets_args,
+            limit=self.args.eval_limit,
+            work_dir=os.path.join(self.args.output_dir, 'eval'),
+            eval_batch_size=max_batch_size,
+            generation_config=self.args.eval_generation_config or {'max_tokens': 512},
+        )
+        # start evaluation
+        eval_report = run_task(task_config)
+        # convert to dict
+        eval_dict = {f'test_{k}': v.score for k, v in eval_report.items()}
+        self.log(eval_dict)
+
+        self.model.train()
+        return eval_dict

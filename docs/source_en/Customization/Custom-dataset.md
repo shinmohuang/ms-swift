@@ -3,7 +3,7 @@
 There are three methods for accessing custom datasets, each offering progressively greater control over preprocessing functions but also increasing in complexity. For example, Solution 1 is the most convenient but offers the least control over preprocessing functions, requiring prior conversion of the dataset into a specific format:
 
 1. **Recommended**: Directly use the command line parameter to access the dataset with `--dataset <dataset_path1> <dataset_path2>`. This will use `AutoPreprocessor` to convert your dataset into a standard format (supporting four dataset formats; see the introduction to AutoPreprocessor below). You can use `--columns` to transform column names. The supported input formats include csv, json, jsonl, txt, and folders (e.g. git clone open-source datasets). This solution does not require modifying `dataset_info.json` and is suitable for users new to ms-swift. The following two solutions are suitable for developers looking to extend ms-swift.
-2. Add the dataset to `dataset_info.json`, which you can refer to in the built-in [dataset_info.json](https://github.com/modelscope/ms-swift/blob/main/swift/llm/dataset/data/dataset_info.json) of ms-swift. This solution also uses AutoPreprocessor to convert the dataset to a standard format. `dataset_info.json` is a list of metadata for datasets, and one of the fields ms_dataset_id/hf_dataset_id/dataset_path must be filled. Column name transformation can be done through the `columns` field. Datasets added to `dataset_info.json` or registered ones will automatically generate [supported dataset documentation](https://swift.readthedocs.io/en/latest/Instruction/Supported-models-and-datasets.html) when running [run_dataset_info.py](https://github.com/modelscope/ms-swift/blob/main/scripts/utils/run_dataset_info.py). In addition, you can use an external `dataset_info.json` by using `--custom_dataset_info xxx.json` to parse the JSON file (convenient for users who use pip install instead of git clone).
+2. Add the dataset to `dataset_info.json`, which you can refer to in the built-in [dataset_info.json](https://github.com/modelscope/ms-swift/blob/main/swift/llm/dataset/data/dataset_info.json) of ms-swift. This solution also uses AutoPreprocessor to convert the dataset to a standard format. `dataset_info.json` is a list of metadata for datasets, and one of the fields ms_dataset_id/hf_dataset_id/dataset_path must be filled. Column name transformation can be done through the `columns` field. Datasets added to `dataset_info.json` or registered ones will automatically generate [supported dataset documentation](https://swift.readthedocs.io/en/latest/Instruction/Supported-models-and-datasets.html) when running [run_dataset_info.py](https://github.com/modelscope/ms-swift/blob/main/scripts/utils/run_dataset_info.py). In addition, you can use the external `dataset_info.json` approach by parsing the JSON file with `--custom_dataset_info xxx.json` (to facilitate users who prefer `pip install` over `git clone`), and then specify `--dataset <dataset_id/dataset_dir/dataset_path>`.
 3. Manually register the dataset to have the most flexible customization capability for preprocessing functions, allowing the use of functions to preprocess datasets, but it is more difficult. You can refer to the [built-in datasets](https://github.com/modelscope/ms-swift/blob/main/swift/llm/dataset/dataset/llm.py) or [examples](https://github.com/modelscope/swift/blob/main/examples/custom). You can specify `--custom_register_path xxx.py` to parse external registration content (convenient for users who use pip install instead of git clone).
    - Solutions one and two leverage solution three under the hood, where the registration process occurs automatically.
 
@@ -13,12 +13,13 @@ The standard dataset format for ms-swift accepts keys such as: 'messages', 'reje
 
 There are three core preprocessors in ms-swift: `MessagesPreprocessor`, `AlpacaPreprocessor`, and `ResponsePreprocessor`. `MessagesPreprocessor` is used to convert datasets in the messages and sharegpt format into the standard format. `AlpacaPreprocessor` converts datasets in the alpaca format, while `ResponsePreprocessor` converts datasets in the query/response format. `AutoPreprocessor` automatically selects the appropriate preprocessor for the task.
 
-The following four formats will all be converted to the messages field in the ms-swift standard format by `AutoPreprocessor`:
+The following four formats will all be converted into the `messages` field of the ms-swift standard format under the processing of `AutoPreprocessor`, meaning they can all be directly used with `--dataset <dataset-path>`:
 
 Messages format (standard format):
 ```jsonl
 {"messages": [{"role": "system", "content": "<system>"}, {"role": "user", "content": "<query1>"}, {"role": "assistant", "content": "<response1>"}, {"role": "user", "content": "<query2>"}, {"role": "assistant", "content": "<response2>"}]}
 ```
+- Note: The system part is optional. The system in the dataset has a higher priority than the `--system` passed through the command line, followed by the `default_system` defined in the template.
 
 ShareGPT format:
 ```jsonl
@@ -80,25 +81,35 @@ The following outlines the standard dataset format for ms-swift, where the "syst
 - Note: GRPO will pass through all additional field content to the ORM, unlike other training methods that, by default, delete extra fields. For example, you can additionally pass in 'solution'. The custom ORM needs to include a positional argument called `completions`, with other arguments as keyword arguments passed through from the additional dataset fields.
 
 ### Sequence Classification
+
+**Single-label Task**:
 ```jsonl
 {"messages": [{"role": "user", "content": "The weather is really nice today"}], "label": 1}
 {"messages": [{"role": "user", "content": "Today is really unlucky"}], "label": 0}
 {"messages": [{"role": "user", "content": "So happy"}], "label": 1}
 ```
 
+**Multi-label Task**:
+
+```jsonl
+{"messages": [{"role": "user", "content": "<sentence>"}], "label": [1, 3, 5]}
+```
+
+**Single Regression Task**:
+
+```jsonl
+{"messages": [{"role": "user", "content": "Calculate the similarity between two sentences, with a range of 0-1.\nsentence1: <sentence1>\nsentence2: <sentence2>"}], "label": 0.8}
+```
+
+**Multi Regression Task**:
+
+```jsonl
+{"messages": [{"role": "user", "content": "<sentence>"}], "label": [1.2, -0.6, 0.8]}
+```
+
 ### Embedding
-label means the similarity between sentences, use together with loss `cosine_similarity`
-```jsonl
-{"messages": [{"role": "assistant", "content": "今天天气真好呀"}], "rejected_response": "今天天气不错", "label": 0.8}
-{"messages": [{"role": "assistant", "content": "这本书不错"}], "rejected_response": "这个汽车开着有异响", "label": 0.2}
-{"messages": [{"role": "assistant", "content": "天空是蓝色的"}], "rejected_response": "教练我想打篮球", "label": 0.0}
-```
-Also, can be the format below（label only support two values: 0.0 and 1.0）, use loss `contrastive` or `online_contrastive`（contrastive learning）:
-```jsonl
-{"messages": [{"role": "assistant", "content": "今天天气真好呀"}], "rejected_response": "今天天气不错", "label": 1.0}
-{"messages": [{"role": "assistant", "content": "这本书不错"}], "rejected_response": "这个汽车开着有异响", "label": 0.0}
-{"messages": [{"role": "assistant", "content": "天空是蓝色的"}], "rejected_response": "教练我想打篮球", "label": 0.0}
-```
+
+Please refer to [embedding训练文档](../BestPractices/Embedding.md#dataset-format).
 
 ### Multimodal
 
@@ -122,8 +133,7 @@ Supervised Fine-tuning:
 {"messages": [{"role": "system", "content": "You are a helpful and harmless assistant."}, {"role": "user", "content": "<image>What is in the image, <video>What is in the video?"}, {"role": "assistant", "content": "The image shows an elephant, and the video shows a puppy running on the grass."}], "images": ["/xxx/x.jpg"], "videos": ["/xxx/x.mp4"]}
 ```
 
-The data formats for RLHF and sequence classification in multimodal models can refer to the formats used in pure text large models.
-
+The data format for RLHF and sequence classification of multimodal models can reference the format of pure text large models, with additional fields such as `images` added on top of that.
 
 #### Grounding
 
@@ -179,7 +189,7 @@ You can refer to the ms-swift built-in [dataset_info.json](https://github.com/mo
     "ms_dataset_id": "xxx/xxx"
   },
   {
-    "dataset_path": "<dataset_path>"
+    "dataset_path": "<dataset_dir/dataset_path>"
   },
   {
     "ms_dataset_id": "<dataset_id>",
@@ -213,21 +223,23 @@ You can refer to the ms-swift built-in [dataset_info.json](https://github.com/mo
 
 The following parameters are supported:
 
-- ms_dataset_id: Refers to the DatasetMeta parameter
-- hf_dataset_id: Refers to the DatasetMeta parameter
-- dataset_path: Refers to the DatasetMeta parameter
-- subsets: Refers to the DatasetMeta parameter
-- split: Refers to the DatasetMeta parameter
-- columns: Transforms column names before preprocessing the dataset
+- ms_dataset_id: Refers to the DatasetMeta parameter.
+- hf_dataset_id: Refers to the DatasetMeta parameter.
+- dataset_path: Refers to the DatasetMeta parameter.
+- dataset_name: Refers to the DatasetMeta parameter.
+- subsets: Refers to the DatasetMeta parameter.
+- split: Refers to the DatasetMeta parameter.
+- columns: Transforms column names before preprocessing the dataset.
 
 ## Dataset Registration
 
 `register_dataset` will register the dataset in `DATASET_MAPPING`. You can call the function `register_dataset(dataset_meta)` to complete the dataset registration, where `dataset_meta` will store the metadata of the model. The parameter list for DatasetMeta is as follows:
 
-- ms_dataset_id: The dataset_id for ModelScope, default is None
-- hf_dataset_id: The dataset_id for HuggingFace, default is None
-- dataset_path: The local path to the dataset (an absolute path is recommended)
-- subsets: A list of subdataset names or a list of `SubsetDataset` objects, default is `['default']`. (The concepts of subdatasets and splits only exist for dataset_id or dataset_dir (open source datasets cloned via git))
-- split: Defaults to `['train']`
-- preprocess_func: A preprocessing function or callable object, default is `AutoPreprocessor()`. This preprocessing function takes an `HfDataset` as input and returns an `HfDataset` in the standard format
+- ms_dataset_id: The dataset_id for ModelScope, default is None.
+- hf_dataset_id: The dataset_id for HuggingFace, default is None.
+- dataset_path: The local path to the dataset (an absolute path is recommended), default is None.
+- dataset_name: The alias of the dataset, which can be specified via `--dataset <dataset_name>`. This is very convenient when the dataset_path is long. The default value is None.
+- subsets: A list of subdataset names or a list of `SubsetDataset` objects, default is `['default']`. (The concepts of subdatasets and splits only exist for dataset_id or dataset_dir (open source datasets cloned via git)).
+- split: Defaults to `['train']`.
+- preprocess_func: A preprocessing function or callable object, default is `AutoPreprocessor()`. This preprocessing function takes an `HfDataset` as input and returns an `HfDataset` in the standard format.
 - load_function: Defaults to `DatasetLoader.load`. If a custom loading function is needed, it should return an `HfDataset` in the standard format, allowing users maximum flexibility while bypassing the ms-swift dataset loading mechanism. This parameter usually does not need to be modified.

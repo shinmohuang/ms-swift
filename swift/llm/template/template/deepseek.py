@@ -45,6 +45,7 @@ class DeepseekVLTemplate(Template):
     image_placeholder = ['<image_placeholder>']
     skip_prompt = False
     use_model = True
+    placeholder_tokens = ['<image_placeholder>']
 
     image_token_num_per_image: int = 576
 
@@ -102,7 +103,7 @@ class DeepseekVLTemplate(Template):
 
     def _post_encode(self, model: nn.Module, inputs: Dict[str, Any]) -> Dict[str, Any]:
         if not inputs.get('generate_mode'):
-            inputs['pixel_values'] = inputs['pixel_values'].to(dtype=self.config.torch_dtype)
+            inputs['pixel_values'] = inputs['pixel_values'].to(dtype=self.model_info.torch_dtype)
             inputs_embeds = model.prepare_inputs_embeds(**inputs)
             return {'inputs_embeds': inputs_embeds}
         else:
@@ -129,7 +130,7 @@ class DeepseekVLTemplate(Template):
 
     def generate(self, model, *args, **kwargs):
         if not kwargs.get('generate_mode'):
-            return model.generate(*args, **kwargs)
+            return super().generate(model, *args, **kwargs)
 
         else:
             # generate how many number of images for each prompt, it is named parallel_size in the author's code
@@ -184,9 +185,9 @@ class DeepseekVLTemplate(Template):
 
             return {'sequences': generated_tokens}
 
-    def decode(self, generate_ids: List[int], is_finished: bool = True, tokenizer_kwargs=None, **kwargs) -> Any:
+    def decode(self, generate_ids: List[int], **kwargs) -> Any:
         if 'template_inputs' not in kwargs or not kwargs['template_inputs'].generate_mode:
-            return super().decode(generate_ids, is_finished, tokenizer_kwargs, **kwargs)
+            return super().decode(generate_ids, **kwargs)
         else:
             img_size = get_env_args('img_size', int, 384)
             patch_size = 16
@@ -217,7 +218,6 @@ class DeepseekVLTemplateMeta(DeepseekTemplateMeta):
     default_system: Optional[str] = ('You are a helpful language and vision assistant. '
                                      'You are able to understand the visual content that the user provides, '
                                      'and assist the user with a variety of tasks using natural language.')
-    placeholder_tokens: List[str] = field(default_factory=lambda: ['<image_placeholder>'])
 
 
 register_template(DeepseekVLTemplateMeta(
@@ -247,19 +247,21 @@ register_template(DeepseekV2_5TemplateMeta(LLMTemplateType.deepseek_v2_5))
 
 class DeepseekR1Template(Template):
 
-    def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
+    def _swift_encode(self, inputs: StdTemplateInputs):
         if not self.is_training:
             for message in inputs.messages:
                 if message['role'] == 'assistant' and isinstance(message['content'], str):
                     message['content'] = message['content'].split('</think>')[-1]
-        return super()._encode(inputs)
+        return super()._swift_encode(inputs)
 
 
-register_template(DeepseekV2_5TemplateMeta(LLMTemplateType.deepseek_r1, template_cls=DeepseekR1Template))
+register_template(
+    DeepseekV2_5TemplateMeta(LLMTemplateType.deepseek_r1, template_cls=DeepseekR1Template, response_prefix='<think>\n'))
 
 
 class DeepseekVL2Template(DeepseekVLTemplate):
     image_placeholder = ['<image>\n']
+    placeholder_tokens = ['<image>']
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         from deepseek_vl2.models.processing_deepseek_vl_v2 import VLChatProcessorOutput
@@ -288,7 +290,7 @@ class DeepseekVL2Template(DeepseekVLTemplate):
             images_seq_mask=torch.tensor(images_seq_mask),
             images_spatial_crop=torch.tensor(images_spatial_crop),
             num_image_tokens=num_image_tokens)
-        output.images = output.images.to(dtype=self.config.torch_dtype)
+        output.images = output.images.to(dtype=self.model_info.torch_dtype)
         encoded = {'output': output, 'input_ids': input_ids, 'labels': labels}
         return encoded
 
@@ -304,7 +306,7 @@ register_template(
         MLLMTemplateType.deepseek_vl2,
         prompt=['<|User|>: {{QUERY}}\n\n<|Assistant|>:'],
         template_cls=DeepseekVL2Template,
-        placeholder_tokens=['<image>']))
+    ))
 
 register_template(
     DeepseekVLTemplateMeta(

@@ -33,6 +33,7 @@ class GOTImageEvalProcessor:
 
 
 class GOT_OCR2Template(Template):
+    placeholder_tokens = ['<imgpad>']
 
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
@@ -43,11 +44,10 @@ class GOT_OCR2Template(Template):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
-        config = self.model_info.config
         images = inputs.images
         image_processor_high = GOTImageEvalProcessor(image_size=1024)
         for i, image in enumerate(images):
-            images[i] = image_processor_high(image)[None].to(config.torch_dtype)
+            images[i] = image_processor_high(image)[None].to(self.model_info.torch_dtype)
         if images:
             encoded['images'] = images
         return encoded
@@ -65,11 +65,11 @@ register_template(
         MLLMTemplateType.got_ocr2,
         default_system='        You should follow the instructions carefully and explain your answers in detail.',
         template_cls=GOT_OCR2Template,
-        placeholder_tokens=['<imgpad>'],
     ))
 
 
 class GOT_OCR2HfTemplate(Template):
+    placeholder_tokens = ['<imgpad>']
 
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
@@ -101,7 +101,6 @@ register_template(
         MLLMTemplateType.got_ocr2_hf,
         default_system='        You should follow the instructions carefully and explain your answers in detail.',
         template_cls=GOT_OCR2HfTemplate,
-        placeholder_tokens=['<imgpad>'],
     ))
 
 

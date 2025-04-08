@@ -6,10 +6,8 @@ from types import MethodType
 from typing import Any, Dict, List, Literal, Optional, Tuple, TypeVar, Union
 
 import torch
-import transformers
 from accelerate.utils import find_device
 from modelscope.hub.utils.utils import get_cache_dir
-from packaging import version
 from transformers import PretrainedConfig
 
 from swift.hub import get_hub
@@ -26,6 +24,9 @@ class AttnImpl:
     sdpa = 'sdpa'
     eager = 'eager'
 
+    attn_impl_keys = ['_attn_implementation', 'attn_implementation', 'llm_attn_implementation']
+    use_flash_attn_keys = ['_flash_attn_2_enabled', 'use_flash_attn', '_use_flash_attention_2']
+
     @staticmethod
     def to_use_flash_attn(attn_impl: Optional[str], auto_value: _T = None) -> Union[bool, _T]:
         if attn_impl is None:
@@ -33,18 +34,21 @@ class AttnImpl:
         return attn_impl == AttnImpl.flash_attn
 
     @staticmethod
-    def update_attn_impl(config: PretrainedConfig, attn_impl: Optional[str], auto_value: _T = None) -> None:
-
-        use_flash_attn = AttnImpl.to_use_flash_attn(attn_impl, auto_value)
-        if use_flash_attn is None:
+    def update_attn_impl(config: PretrainedConfig,
+                         attn_impl: Optional[str],
+                         attn_impl_keys: Optional[List[str]] = None) -> None:
+        if attn_impl is None:
             return
-        from swift.llm import HfConfigFactory
-        if version.parse(transformers.__version__) >= version.parse('4.36'):
-            if use_flash_attn:
-                attn_impl = 'flash_attention_2'
-            HfConfigFactory.set_config_attr(config, '_attn_implementation', attn_impl)
-        else:
-            HfConfigFactory.set_config_attr(config, '_flash_attn_2_enabled', use_flash_attn)
+        use_flash_attn = AttnImpl.to_use_flash_attn(attn_impl)
+        if use_flash_attn:
+            attn_impl = 'flash_attention_2'
+        if isinstance(attn_impl_keys, str):
+            attn_impl_keys = [attn_impl_keys]
+        attn_impl_keys = attn_impl_keys or AttnImpl.attn_impl_keys
+        for key in attn_impl_keys:
+            HfConfigFactory.set_config_attr(config, key, attn_impl, ensure_set=False)
+        for key in AttnImpl.use_flash_attn_keys:
+            HfConfigFactory.set_config_attr(config, key, use_flash_attn, ensure_set=False)
 
 
 @dataclass
@@ -84,19 +88,26 @@ class HfConfigFactory:
 
     @staticmethod
     def _get_config_attrs(config: Union[PretrainedConfig, Dict[str, Any]],
-                          attr_name: str) -> List[Tuple[PretrainedConfig, Any]]:
+                          attr_name: str,
+                          parent_key: Optional[str] = None) -> List[Tuple[PretrainedConfig, Any]]:
         res = []
-        for key in [None, 'language_config', 'llm_config', 'text_config']:
-            if key is not None:
+        if isinstance(config, dict):
+            keys = config.keys()
+        elif isinstance(config, PretrainedConfig):
+            keys = dir(config)
+        else:
+            return []
+
+        for k in keys:
+            if k.endswith('_config'):
                 if isinstance(config, dict):
-                    llm_config = config.get(key)
+                    v = config[k]
                 else:
-                    llm_config = getattr(config, key, None)
-            else:
-                llm_config = config
-            value = deep_getattr(llm_config, attr_name, None)
-            if value is not None:
-                res.append((llm_config, value))
+                    v = getattr(config, k)
+                res += HfConfigFactory._get_config_attrs(v, attr_name, k)
+        value = deep_getattr(config, attr_name, None)
+        if value is not None and parent_key in [None, 'language_config', 'llm_config', 'text_config']:
+            res.append((config, value))
         return res
 
     @staticmethod
@@ -109,16 +120,20 @@ class HfConfigFactory:
             return attrs[0][1]
 
     @staticmethod
-    def set_config_attr(config: Union[PretrainedConfig, Dict[str, Any]], attr_name: str, value: Any) -> None:
+    def set_config_attr(config: Union[PretrainedConfig, Dict[str, Any]],
+                        attr_name: str,
+                        value: Any,
+                        ensure_set: bool = True) -> int:
         """Set all the attr_name attributes to value."""
         attrs = HfConfigFactory._get_config_attrs(config, attr_name)
-        if len(attrs) == 0:
+        if ensure_set and len(attrs) == 0:
             attrs.append((config, None))
         for config, _ in attrs:
             if isinstance(config, dict):
                 config[attr_name] = value
             else:
                 setattr(config, attr_name, value)
+        return len(attrs)
 
     @staticmethod
     def set_model_config_attr(model, attr_name: str, value: Any) -> None:
@@ -229,19 +244,22 @@ def safe_snapshot_download(model_id_or_path: str,
             logger.info(f'Loading the model using local model_dir: {model_dir}')
             return model_dir
     if ignore_patterns is None:
-        ignore_patterns = []
-    ignore_patterns += [
-        '*.zip', '*.gguf', '*.pth', '*.pt', 'consolidated*', 'onnx/*', '*.safetensors.md', '*.msgpack', '*.onnx',
-        '*.ot', '*.h5'
-    ]
+        ignore_patterns = [
+            '*.zip', '*.gguf', '*.pth', '*.pt', 'consolidated*', 'onnx/*', '*.safetensors.md', '*.msgpack', '*.onnx',
+            '*.ot', '*.h5'
+        ]
     if not download_model:
         ignore_patterns += ['*.bin', '*.safetensors']
     hub = get_hub(use_hf)
     if model_id_or_path.startswith('~'):
         model_id_or_path = os.path.abspath(os.path.expanduser(model_id_or_path))
     with safe_ddp_context(hash_id=model_id_or_path):
+        model_path_to_check = '/'.join(model_id_or_path.split(':', 1))
         if os.path.exists(model_id_or_path):
             model_dir = model_id_or_path
+            sub_folder = None
+        elif os.path.exists(model_path_to_check):
+            model_dir = model_path_to_check
             sub_folder = None
         else:
             if model_id_or_path.startswith('/'):  # startswith
@@ -312,8 +330,12 @@ def use_submodel_func(model, submodel_name: str, func_list: Optional[List[str]] 
                 device = find_device(args)
                 if device is None:
                     device = find_device(kwargs)
-                res.logits = to_device(res.logits, device)
-                res.loss = to_device(res.loss, device)
+                if hasattr(res, 'logits'):
+                    res.logits = to_device(res.logits, device)
+                if hasattr(res, 'loss'):
+                    res.loss = to_device(res.loss, device)
+                if isinstance(res, dict) and 'last_hidden_state' in res:
+                    res['last_hidden_state'] = to_device(res['last_hidden_state'], device)
             return res
 
         return _new_func

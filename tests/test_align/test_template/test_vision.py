@@ -6,7 +6,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
 os.environ['SWIFT_DEBUG'] = '1'
 
 
-def _infer_model(pt_engine, system=None, messages=None, images=None):
+def _infer_model(pt_engine, system=None, messages=None, images=None, **kwargs):
     seed_everything(42)
     request_config = RequestConfig(max_tokens=128, temperature=0, repetition_penalty=1)
     if messages is None:
@@ -21,7 +21,7 @@ def _infer_model(pt_engine, system=None, messages=None, images=None):
         messages = messages.copy()
     if images is None:
         images = ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/cat.png']
-    resp = pt_engine.infer([{'messages': messages, 'images': images}], request_config=request_config)
+    resp = pt_engine.infer([{'messages': messages, 'images': images, **kwargs}], request_config=request_config)
     response = resp[0].choices[0].message.content
     messages += [{'role': 'assistant', 'content': response}]
     logger.info(f'model: {pt_engine.model_info.model_name}, messages: {messages}')
@@ -44,10 +44,18 @@ def test_qwen2_5_vl():
     pt_engine.default_template.template_backend = 'jinja'
     response2 = _infer_model(pt_engine, messages=messages, images=images)
     assert response == response2 == (
-        'The dog in the picture appears to be a Labrador Retriever. Labradors are known for their friendly and '
-        'energetic nature, which is evident in the image where the dog seems to be interacting playfully with '
-        'the person. The breed is characterized by its thick, water-repellent coat, which can come in various '
-        'colors including yellow, black, and chocolate.')
+        'The dog in the picture appears to be a Labrador Retriever. Labradors are known for their '
+        'friendly and energetic nature, which is evident in the image where the dog seems to be '
+        "interacting playfully with the person. The dog's size, coat color, and build are "
+        'characteristic of the Labrador Retriever breed.')
+
+
+def test_qwen2_5_omni():
+    pt_engine = PtEngine('Qwen/Qwen2.5-Omni-7B')
+    response = _infer_model(pt_engine)
+    pt_engine.default_template.template_backend = 'jinja'
+    response2 = _infer_model(pt_engine)
+    assert response == response2
 
 
 def test_qvq():
@@ -60,9 +68,10 @@ def test_qvq():
 
 def test_internvl2():
     pt_engine = PtEngine('OpenGVLab/InternVL2-2B')
-    _infer_model(pt_engine)
+    response = _infer_model(pt_engine)
     pt_engine.default_template.template_backend = 'jinja'
-    _infer_model(pt_engine)
+    response2 = _infer_model(pt_engine)
+    assert response == response2
 
 
 def test_internvl2_phi3():
@@ -181,10 +190,11 @@ def test_llama_vision():
 
 
 def test_llava_hf():
-    pt_engine = PtEngine('swift/llava-v1.6-mistral-7b-hf')
-    _infer_model(pt_engine)
+    pt_engine = PtEngine('llava-hf/llava-v1.6-mistral-7b-hf')
+    response = _infer_model(pt_engine)
     pt_engine.default_template.template_backend = 'jinja'
-    _infer_model(pt_engine)
+    response2 = _infer_model(pt_engine)
+    assert response == response2
 
 
 def test_florence():
@@ -214,8 +224,11 @@ def test_qwen_vl():
 
 
 def test_llava_onevision_hf():
-    pt_engine = PtEngine('AI-ModelScope/llava-onevision-qwen2-0.5b-ov-hf')
-    _infer_model(pt_engine)
+    pt_engine = PtEngine('llava-hf/llava-onevision-qwen2-0.5b-ov-hf')
+    response = _infer_model(pt_engine)
+    pt_engine.default_template.template_backend = 'jinja'
+    response2 = _infer_model(pt_engine)
+    assert response == response2
 
 
 def test_xcomposer2_5():
@@ -258,17 +271,19 @@ def test_mplug_owl2():
 def test_mplug_owl3():
     # pt_engine = PtEngine('iic/mPLUG-Owl3-7B-240728')
     pt_engine = PtEngine('iic/mPLUG-Owl3-7B-241101')
-    _infer_model(pt_engine, system='')
+    response = _infer_model(pt_engine, system='')
     pt_engine.default_template.template_backend = 'jinja'
-    _infer_model(pt_engine, system='')
+    response2 = _infer_model(pt_engine, system='')
+    assert response == response2
 
 
 def test_ovis1_6():
     pt_engine = PtEngine('AIDC-AI/Ovis1.6-Gemma2-9B')
     # pt_engine = PtEngine('AIDC-AI/Ovis1.6-Gemma2-27B')
-    _infer_model(pt_engine)
+    response = _infer_model(pt_engine)
     pt_engine.default_template.template_backend = 'jinja'
-    _infer_model(pt_engine)
+    response2 = _infer_model(pt_engine)
+    assert response == response2
 
 
 def test_ovis1_6_llama3():
@@ -283,11 +298,11 @@ def test_ovis1_6_llama3():
 
 
 def test_ovis2():
-    pt_engine = PtEngine('AIDC-AI/Ovis2-2B')
+    pt_engine = PtEngine('AIDC-AI/Ovis2-2B')  # with flash_attn
     response = _infer_model(pt_engine, messages=[{'role': 'user', 'content': 'Describe the image.'}])
-    assert response[:200] == (
-        'The image showcases a charming digital illustration of a young kitten. The kitten has striking blue '
-        'eyes and a mix of gray, white, and black fur, with distinctive black stripes on its head. Its ears a')
+    assert response[:200] == ('The image features a close-up portrait of a young kitten with striking blue eyes. '
+                              'The kitten has a distinctive coat pattern with a mix of gray, black, and white fur, '
+                              'typical of a tabby pattern. Its ea')
 
 
 def test_paligemma():
@@ -457,6 +472,55 @@ call_user() # Submit the task and call the user when the task is unsolvable, or 
     assert response == response2
 
 
+def test_phi4_vision():
+    pt_engine = PtEngine('LLM-Research/Phi-4-multimodal-instruct')
+    response = _infer_model(pt_engine, messages=[{'role': 'user', 'content': 'describe the image.'}])
+    assert response == (
+        "The image features a close-up of a kitten's face. The kitten has large, "
+        'round eyes with a bright gaze, and its fur is predominantly white with black stripes. '
+        "The kitten's ears are pointed and alert, and its whiskers are visible. The background is blurred, "
+        "drawing focus to the kitten's face.")
+    response = _infer_model(
+        pt_engine,
+        messages=[{
+            'role': 'user',
+            'content': 'describe the audio.'
+        }],
+        images=[],
+        audios=['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/weather.wav'])
+    assert response == '今天天气真好呀'
+
+
+def test_gemma3_vision():
+    pt_engine = PtEngine('LLM-Research/gemma-3-4b-it')
+    response = _infer_model(pt_engine)
+    pt_engine.default_template.template_backend = 'jinja'
+    response2 = _infer_model(pt_engine)
+    assert response == response2
+
+
+def test_mistral_2503():
+    pt_engine = PtEngine('mistralai/Mistral-Small-3.1-24B-Instruct-2503')
+    response = _infer_model(pt_engine, messages=[{'role': 'user', 'content': 'What is shown in this image?'}])
+    assert response == (
+        'The image shows a close-up of a Siamese kitten. The kitten has distinctive blue almond-shaped eyes, '
+        'a pink nose, and a light-colored coat with darker points on the ears, paws, tail, and face, '
+        'which are characteristic features of the Siamese breed. '
+        'The kitten appears to be looking directly at the viewer with a curious and endearing expression.')
+
+
+def test_llama4():
+    pt_engine = PtEngine('LLM-Research/Llama-4-Scout-17B-16E-Instruct')
+    messages = [{'role': 'user', 'content': '<image><image>What is the difference between the two images?'}]
+    images = [
+        'http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/cat.png',
+        'http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/animal.png'
+    ]
+    response = _infer_model(pt_engine, messages=messages, images=images)
+    assert response[:128] == ('The two images are distinct in their subject matter and style. The first image features '
+                              'a realistic depiction of a kitten, while') and len(response) == 654
+
+
 if __name__ == '__main__':
     from swift.llm import PtEngine, RequestConfig, get_template
     from swift.utils import get_logger, seed_everything
@@ -464,12 +528,13 @@ if __name__ == '__main__':
     logger = get_logger()
     # test_qwen2_vl()
     # test_qwen2_5_vl()
+    # test_qwen2_5_omni()
     # test_internvl2()
     # test_internvl2_phi3()
     # test_llava()
     # test_ovis1_6()
     # test_ovis1_6_llama3()
-    test_ovis2()
+    # test_ovis2()
     # test_yi_vl()
     # test_deepseek_vl()
     # test_deepseek_janus()
@@ -480,7 +545,7 @@ if __name__ == '__main__':
     # test_llava_onevision_hf()
     # test_minicpmv()
     # test_got_ocr()
-    test_got_ocr_hf()
+    # test_got_ocr_hf()
     # test_paligemma()
     # test_paligemma2()
     # test_pixtral()
@@ -489,6 +554,7 @@ if __name__ == '__main__':
     # test_florence()
     # test_glm_edge_v()
     # test_phi3_vision()
+    # test_phi4_vision()
     # test_internvl2_5()
     # test_internvl2_5_mpo()
     # test_mplug_owl3()
@@ -502,3 +568,6 @@ if __name__ == '__main__':
     # test_minicpmo()
     # test_valley()
     # test_ui_tars()
+    # test_gemma3_vision()
+    # test_mistral_2503()
+    test_llama4()
